@@ -31,6 +31,7 @@ def run_gui() -> int:
         from PySide6.QtWidgets import (
             QApplication,
             QAbstractItemView,
+            QCheckBox,
             QComboBox,
             QFileDialog,
             QFormLayout,
@@ -100,6 +101,11 @@ def run_gui() -> int:
             self.segment_padding.setValue(1.0)
             self.segment_padding.setSuffix(" 秒")
             self.segment_padding.setToolTip("每段開始前與結束後各延伸此時間；相鄰片段可以重疊")
+            self.noise_reduction = QCheckBox("啟用保守型語音去雜音")
+            self.noise_reduction.setChecked(True)
+            self.noise_reduction.setToolTip(
+                "在 Whisper 分段與情緒分析前，先降低持續性的風扇、冷氣與底噪"
+            )
             self.progress_bar = QProgressBar()
             self.status = QLabel("就緒")
             self.log = QPlainTextEdit()
@@ -132,6 +138,7 @@ def run_gui() -> int:
             form.addRow("分段數量", self.segment_count)
             form.addRow("Whisper 文字匹配門檻", self.threshold)
             form.addRow("切段前後緩衝（可重疊）", self.segment_padding)
+            form.addRow("背景雜音處理", self.noise_reduction)
 
             buttons = QHBoxLayout()
             buttons.addWidget(self.start_button)
@@ -1184,6 +1191,7 @@ def run_gui() -> int:
             self.segment_count.setValue(1)
             self.threshold.setValue(0.30)
             self.segment_padding.setValue(1.0)
+            self.noise_reduction.setChecked(True)
             self.progress_bar.setValue(0)
             self.status.setText("就緒")
             self.log.clear()
@@ -1232,6 +1240,7 @@ def run_gui() -> int:
                     match_threshold=self.threshold.value(),
                     output_excel=source / "emotion_analysis_result.xlsx",
                     segment_padding_seconds=self.segment_padding.value(),
+                    noise_reduction_enabled=self.noise_reduction.isChecked(),
                 )
                 for source in sources
             ]

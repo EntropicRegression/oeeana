@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .core import AnalysisConfig, BatchAnalyzer
+from .core import AnalysisConfig, BatchAnalyzer, DEFAULT_NOISE_REDUCTION_PROFILE
 
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
@@ -25,6 +25,8 @@ def _config_to_payload(config: AnalysisConfig) -> dict[str, object]:
         "model_name": config.model_name,
         "emotion_model_name": config.emotion_model_name,
         "segment_padding_seconds": config.segment_padding_seconds,
+        "noise_reduction_enabled": config.noise_reduction_enabled,
+        "noise_reduction_profile": config.noise_reduction_profile,
         "recursive": config.recursive,
     }
 
@@ -56,6 +58,10 @@ def _payload_to_config(payload: Mapping[str, object]) -> AnalysisConfig:
         model_name=str(payload.get("model_name", "large-v3")),
         emotion_model_name=str(payload.get("emotion_model_name", "iic/emotion2vec_plus_large")),
         segment_padding_seconds=float(payload.get("segment_padding_seconds", 1.0)),
+        noise_reduction_enabled=bool(payload.get("noise_reduction_enabled", True)),
+        noise_reduction_profile=str(
+            payload.get("noise_reduction_profile", DEFAULT_NOISE_REDUCTION_PROFILE)
+        ),
         recursive=bool(payload.get("recursive", False)),
     )
 

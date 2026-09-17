@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import math
 import os
 import re
@@ -35,6 +37,11 @@ ProgressCallback = Callable[[int, str], None]
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_WHISPER_MODEL = PROJECT_ROOT / "models" / "faster-whisper-large-v3"
 LOCAL_EMOTION_MODEL = PROJECT_ROOT / "models" / "emotion2vec_plus_large"
+DEFAULT_NOISE_REDUCTION_PROFILE = "speech_conservative_v1"
+NOISE_REDUCTION_FILTERS = {
+    DEFAULT_NOISE_REDUCTION_PROFILE: "afftdn=nr=8:nf=-50:tn=1:gs=5",
+}
+CACHE_SCHEMA_VERSION = 1
 
 
 class AnalysisError(RuntimeError):
@@ -60,6 +67,8 @@ class AnalysisConfig:
     emotion_model_name: str = "iic/emotion2vec_plus_large"
     segment_padding_seconds: float = 1.0
     recursive: bool = False
+    noise_reduction_enabled: bool = True
+    noise_reduction_profile: str = DEFAULT_NOISE_REDUCTION_PROFILE
 
 
 @dataclass
@@ -225,7 +234,12 @@ def _find_ffmpeg() -> str:
     raise AnalysisError("找不到 FFmpeg。請將 ffmpeg.exe 放入 resources，或加入 PATH。")
 
 
-def decode_audio(path: Path, ffmpeg_path: str | None = None) -> np.ndarray:
+def _decode_audio(
+    path: Path,
+    ffmpeg_path: str | None = None,
+    *,
+    audio_filter: str | None = None,
+) -> np.ndarray:
     command = [
         ffmpeg_path or _find_ffmpeg(),
         "-hide_banner",
@@ -233,14 +247,20 @@ def decode_audio(path: Path, ffmpeg_path: str | None = None) -> np.ndarray:
         "error",
         "-i",
         str(path),
-        "-f",
-        "f32le",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "pipe:1",
     ]
+    if audio_filter:
+        command.extend(["-af", audio_filter])
+    command.extend(
+        [
+            "-f",
+            "f32le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "pipe:1",
+        ]
+    )
     try:
         completed = subprocess.run(command, capture_output=True, check=True)
     except FileNotFoundError as exc:
@@ -252,6 +272,28 @@ def decode_audio(path: Path, ffmpeg_path: str | None = None) -> np.ndarray:
     if audio.size == 0:
         raise AnalysisError(f"音檔沒有可分析的音訊：{path.name}")
     return audio
+
+
+def decode_audio(path: Path, ffmpeg_path: str | None = None) -> np.ndarray:
+    """Decode audio without enhancement, primarily for processed cache files."""
+    return _decode_audio(path, ffmpeg_path)
+
+
+def preprocess_audio(
+    path: Path,
+    ffmpeg_path: str | None = None,
+    *,
+    noise_reduction_enabled: bool = True,
+    noise_reduction_profile: str = DEFAULT_NOISE_REDUCTION_PROFILE,
+) -> np.ndarray:
+    """Decode a source file and apply configured enhancement exactly once."""
+    audio_filter = None
+    if noise_reduction_enabled:
+        try:
+            audio_filter = NOISE_REDUCTION_FILTERS[noise_reduction_profile]
+        except KeyError as exc:
+            raise AnalysisError(f"不支援的去雜音模式：{noise_reduction_profile}") from exc
+    return _decode_audio(path, ffmpeg_path, audio_filter=audio_filter)
 
 
 def _write_temp_wav(audio: np.ndarray) -> str:
@@ -700,6 +742,54 @@ class WhisperSegmenter:
         cache_dir = audio_path.parent / "chopped"
         return [cache_dir / f"{audio_path.stem}_段落{index}.wav" for index in range(1, segment_count + 1)]
 
+    @staticmethod
+    def _cache_manifest_path(audio_path: Path) -> Path:
+        return audio_path.parent / "chopped" / f"{audio_path.stem}_cache.json"
+
+    @staticmethod
+    def _cache_manifest(
+        audio_path: Path,
+        paragraphs: Sequence[tuple[str, str]],
+        threshold: float,
+        padding_seconds: float,
+        noise_reduction_enabled: bool,
+        noise_reduction_profile: str,
+    ) -> dict[str, object]:
+        stat = audio_path.stat()
+        transcript_payload = json.dumps(
+            list(paragraphs), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "source_path": str(audio_path.resolve()),
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "segment_count": len(paragraphs),
+            "transcript_sha256": hashlib.sha256(transcript_payload).hexdigest(),
+            "match_threshold": threshold,
+            "segment_padding_seconds": padding_seconds,
+            "noise_reduction_enabled": noise_reduction_enabled,
+            "noise_reduction_profile": noise_reduction_profile,
+        }
+
+    @staticmethod
+    def _read_cache_manifest(path: Path) -> dict[str, object] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _write_cache_manifest(path: Path, manifest: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
     def segment(
         self,
         audio_path: Path,
@@ -708,16 +798,36 @@ class WhisperSegmenter:
         threshold: float,
         padding_seconds: float,
         ffmpeg_path: str | None = None,
+        noise_reduction_enabled: bool = True,
+        noise_reduction_profile: str = DEFAULT_NOISE_REDUCTION_PROFILE,
     ) -> list[SegmentedAudio]:
         cache_paths = self._cache_paths(audio_path, len(paragraphs))
-        if all(path.is_file() for path in cache_paths):
-            cached: list[SegmentedAudio] = []
-            for index, path in enumerate(cache_paths):
-                cached_audio = decode_audio(path, ffmpeg_path)
-                cached.append(
-                    SegmentedAudio(index, 0.0, len(cached_audio) / 16000.0, 1.0, cached_audio)
-                )
-            return cached
+        manifest_path = self._cache_manifest_path(audio_path)
+        expected_manifest = self._cache_manifest(
+            audio_path,
+            paragraphs,
+            threshold,
+            padding_seconds,
+            noise_reduction_enabled,
+            noise_reduction_profile,
+        )
+        if (
+            all(path.is_file() for path in cache_paths)
+            and self._read_cache_manifest(manifest_path) == expected_manifest
+        ):
+            try:
+                cached = []
+                for index, path in enumerate(cache_paths):
+                    cached_audio = decode_audio(path, ffmpeg_path)
+                    cached.append(
+                        SegmentedAudio(index, 0.0, len(cached_audio) / 16000.0, 1.0, cached_audio)
+                    )
+            except AnalysisError:
+                manifest_path.unlink(missing_ok=True)
+            else:
+                return cached
+        else:
+            manifest_path.unlink(missing_ok=True)
 
         segments_gen, _ = self.model.transcribe(
             audio,
@@ -832,6 +942,10 @@ class WhisperSegmenter:
             segment_audio = audio[start_index:end_index]
             _write_wav_file(cache_paths[index], segment_audio)
             results.append(SegmentedAudio(index, start, end, match.score, segment_audio))
+        if all(result.audio is not None for result in results) and all(
+            path.is_file() for path in cache_paths
+        ):
+            self._write_cache_manifest(manifest_path, expected_manifest)
         return results
 
     def close(self) -> None:
@@ -967,9 +1081,14 @@ class BatchAnalyzer:
         # loading emotion2vec+. This avoids keeping both large models in GPU memory.
         try:
             self._check_cancel(cancel_event)
-            self._report(progress, 0, f"切段標準音檔：{reference.name}")
+            self._report(progress, 0, f"預處理並切段標準音檔：{reference.name}")
             try:
-                audio = decode_audio(reference, self.ffmpeg_path)
+                audio = preprocess_audio(
+                    reference,
+                    self.ffmpeg_path,
+                    noise_reduction_enabled=primary.noise_reduction_enabled,
+                    noise_reduction_profile=primary.noise_reduction_profile,
+                )
                 boundaries = self.whisper_segmenter.segment(
                     reference,
                     audio,
@@ -977,6 +1096,8 @@ class BatchAnalyzer:
                     primary.match_threshold,
                     primary.segment_padding_seconds,
                     self.ffmpeg_path,
+                    primary.noise_reduction_enabled,
+                    primary.noise_reduction_profile,
                 )
             except AnalysisError as exc:
                 raise AnalysisError(f"標準音檔無法分段：{exc}") from exc
@@ -988,9 +1109,14 @@ class BatchAnalyzer:
                 for audio_path in files:
                     self._check_cancel(cancel_event)
                     percent = int(processed_audio * 45 / max(1, total_audio))
-                    self._report(progress, percent, f"切段 [{folder_label}]：{audio_path.name}")
+                    self._report(progress, percent, f"預處理並切段 [{folder_label}]：{audio_path.name}")
                     try:
-                        audio = decode_audio(audio_path, self.ffmpeg_path)
+                        audio = preprocess_audio(
+                            audio_path,
+                            self.ffmpeg_path,
+                            noise_reduction_enabled=config.noise_reduction_enabled,
+                            noise_reduction_profile=config.noise_reduction_profile,
+                        )
                         boundaries = self.whisper_segmenter.segment(
                             audio_path,
                             audio,
@@ -998,6 +1124,8 @@ class BatchAnalyzer:
                             config.match_threshold,
                             config.segment_padding_seconds,
                             self.ffmpeg_path,
+                            config.noise_reduction_enabled,
+                            config.noise_reduction_profile,
                         )
                     except AnalysisError as exc:
                         prepared_groups[group_index].append(
@@ -1060,6 +1188,8 @@ class BatchAnalyzer:
                     "matching_strategy": "ordered_dp_with_context_relaxation",
                     "relaxed_match_floor": max(0.20, config.match_threshold - 0.05),
                     "segment_padding_seconds": config.segment_padding_seconds,
+                    "noise_reduction_enabled": config.noise_reduction_enabled,
+                    "noise_reduction_profile": config.noise_reduction_profile,
                 },
             )
             all_results.append(result_rows)
@@ -1079,6 +1209,8 @@ class BatchAnalyzer:
             primary.model_name,
             primary.emotion_model_name,
             primary.segment_padding_seconds,
+            primary.noise_reduction_enabled,
+            primary.noise_reduction_profile,
         )
         for config in configs[1:]:
             candidate = (
@@ -1089,6 +1221,8 @@ class BatchAnalyzer:
                 config.model_name,
                 config.emotion_model_name,
                 config.segment_padding_seconds,
+                config.noise_reduction_enabled,
+                config.noise_reduction_profile,
             )
             if candidate != shared:
                 raise AnalysisError("同一批次的標準音檔、文字分段與模型參數必須一致。")
@@ -1141,6 +1275,11 @@ class BatchAnalyzer:
             raise AnalysisError("Whisper 文字匹配門檻必須介於 0 與 1。")
         if not 0.0 <= config.segment_padding_seconds <= 5.0:
             raise AnalysisError("切段前後緩衝必須介於 0 與 5 秒。")
+        if (
+            config.noise_reduction_enabled
+            and config.noise_reduction_profile not in NOISE_REDUCTION_FILTERS
+        ):
+            raise AnalysisError(f"不支援的去雜音模式：{config.noise_reduction_profile}")
         if not config.reference_audio.is_file():
             raise AnalysisError("找不到標準音檔。")
         if not config.transcript_file.is_file():
