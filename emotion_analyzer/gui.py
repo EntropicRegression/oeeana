@@ -10,7 +10,13 @@ from .analytics import (
     create_pairing_rows,
     merge_run_analyses,
 )
-from .core import AnalysisConfig, clear_chopped_directories, read_transcript
+from .core import (
+    AnalysisConfig,
+    DEFAULT_EMOTION_MODEL,
+    EMOTION_MODEL_OPTIONS,
+    clear_chopped_directories,
+    read_transcript,
+)
 from .reporting import read_run_report, write_comparison_report
 from .worker import create_job_file, decode_event
 
@@ -101,6 +107,15 @@ def run_gui() -> int:
             self.segment_padding.setValue(1.0)
             self.segment_padding.setSuffix(" 秒")
             self.segment_padding.setToolTip("每段開始前與結束後各延伸此時間；相鄰片段可以重疊")
+            self.emotion_model = QComboBox()
+            for label, model_name in EMOTION_MODEL_OPTIONS:
+                self.emotion_model.addItem(label, model_name)
+            self.emotion_model.setCurrentIndex(
+                max(0, self.emotion_model.findData(DEFAULT_EMOTION_MODEL))
+            )
+            self.emotion_model.setToolTip(
+                "large 為目前預設；未安裝於 models/ 的版本會由 ModelScope 載入"
+            )
             self.noise_reduction = QCheckBox("啟用保守型語音去雜音")
             self.noise_reduction.setChecked(True)
             self.noise_reduction.setToolTip(
@@ -138,6 +153,7 @@ def run_gui() -> int:
             form.addRow("分段數量", self.segment_count)
             form.addRow("Whisper 文字匹配門檻", self.threshold)
             form.addRow("切段前後緩衝（可重疊）", self.segment_padding)
+            form.addRow("emotion2vec+ 模型", self.emotion_model)
             form.addRow("背景雜音處理", self.noise_reduction)
 
             buttons = QHBoxLayout()
@@ -1191,6 +1207,9 @@ def run_gui() -> int:
             self.segment_count.setValue(1)
             self.threshold.setValue(0.30)
             self.segment_padding.setValue(1.0)
+            self.emotion_model.setCurrentIndex(
+                max(0, self.emotion_model.findData(DEFAULT_EMOTION_MODEL))
+            )
             self.noise_reduction.setChecked(True)
             self.progress_bar.setValue(0)
             self.status.setText("就緒")
@@ -1239,6 +1258,7 @@ def run_gui() -> int:
                     source_directory=source,
                     match_threshold=self.threshold.value(),
                     output_excel=source / "emotion_analysis_result.xlsx",
+                    emotion_model_name=str(self.emotion_model.currentData()),
                     segment_padding_seconds=self.segment_padding.value(),
                     noise_reduction_enabled=self.noise_reduction.isChecked(),
                 )

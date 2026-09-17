@@ -10,9 +10,9 @@ Whisper、emotion2vec+ 與 Excel 匯出會在獨立分析行程執行，避免�
 python -m pip install -r requirements.txt
 ```
 
-`imageio-ffmpeg` 會提供 FFmpeg；若已安裝系統 FFmpeg 或將 `ffmpeg.exe` 放在 `emotion_analyzer/resources/`，程式也會優先使用它。emotion2vec+ 預設模型為 `iic/emotion2vec_plus_large`，第一次執行可能需要下載模型。
+`imageio-ffmpeg` 會提供 FFmpeg；若已安裝系統 FFmpeg 或將 `ffmpeg.exe` 放在 `emotion_analyzer/resources/`，程式也會優先使用它。emotion2vec+ 預設模型為 `iic/emotion2vec_plus_large`，也可在介面改選 `emotion2vec_plus_base` 或 `emotion2vec_plus_seed`；第一次使用尚未安裝的模型時可能需要下載。
 
-若 `models/faster-whisper-large-v3/` 與 `models/emotion2vec_plus_large/` 存在，程式會優先使用這兩份本機模型，不需重新下載；缺少本機模型時才使用原本的遠端模型名稱。
+若 `models/faster-whisper-large-v3/` 或對應的 `models/emotion2vec_plus_large/`、`models/emotion2vec_plus_base/`、`models/emotion2vec_plus_seed/` 存在，程式會優先使用本機模型，不需重新下載；缺少本機模型時才使用原本的遠端模型名稱。目前專案隨附的是 emotion2vec+ large。
 
 ## 執行
 
@@ -20,7 +20,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-介面參數：標準音檔、分段文字檔、需分析的檔案資料夾、Whisper 相似度門檻與背景雜音處理。分段文字檔需為 UTF-8；選取檔案後會自動解析並填入段落數量。
+介面參數：標準音檔、分段文字檔、需分析的檔案資料夾、Whisper 相似度門檻、emotion2vec+ 模型版本與背景雜音處理。分段文字檔需為 UTF-8；選取檔案後會自動解析並填入段落數量。
 
 「背景雜音處理」預設開啟，會在 Whisper 分段與 emotion2vec+ 分析前，以保守設定降低持續性的風扇、冷氣與底噪。它不適合修復削波、強烈回音、背景音樂或其他人聲。
 

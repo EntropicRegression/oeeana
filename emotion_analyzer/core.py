@@ -36,7 +36,16 @@ SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
 ProgressCallback = Callable[[int, str], None]
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_WHISPER_MODEL = PROJECT_ROOT / "models" / "faster-whisper-large-v3"
-LOCAL_EMOTION_MODEL = PROJECT_ROOT / "models" / "emotion2vec_plus_large"
+DEFAULT_EMOTION_MODEL = "iic/emotion2vec_plus_large"
+EMOTION_MODEL_OPTIONS = (
+    ("emotion2vec+ large（約 300M）", DEFAULT_EMOTION_MODEL),
+    ("emotion2vec+ base（約 90M）", "iic/emotion2vec_plus_base"),
+    ("emotion2vec+ seed（學術語料版）", "iic/emotion2vec_plus_seed"),
+)
+LOCAL_EMOTION_MODELS = {
+    model_name: PROJECT_ROOT / "models" / model_name.rsplit("/", 1)[-1]
+    for _, model_name in EMOTION_MODEL_OPTIONS
+}
 DEFAULT_NOISE_REDUCTION_PROFILE = "speech_conservative_v1"
 NOISE_REDUCTION_FILTERS = {
     DEFAULT_NOISE_REDUCTION_PROFILE: "afftdn=nr=8:nf=-50:tn=1:gs=5",
@@ -55,6 +64,15 @@ def _prefer_local_model(model_name: str, local_path: Path, aliases: set[str]) ->
     return model_name
 
 
+def _prefer_local_emotion_model(model_name: str) -> str:
+    """Resolve known emotion2vec+ variants from models/ before using ModelScope."""
+    canonical_name = model_name if "/" in model_name else f"iic/{model_name}"
+    local_path = LOCAL_EMOTION_MODELS.get(canonical_name)
+    if local_path is not None and local_path.is_dir():
+        return str(local_path)
+    return model_name
+
+
 @dataclass(frozen=True)
 class AnalysisConfig:
     reference_audio: Path
@@ -64,7 +82,7 @@ class AnalysisConfig:
     match_threshold: float = 0.30
     output_excel: Path = Path("analysis_result.xlsx")
     model_name: str = "large-v3"
-    emotion_model_name: str = "iic/emotion2vec_plus_large"
+    emotion_model_name: str = DEFAULT_EMOTION_MODEL
     segment_padding_seconds: float = 1.0
     recursive: bool = False
     noise_reduction_enabled: bool = True
@@ -961,16 +979,12 @@ class WhisperSegmenter:
 
 
 class Emotion2VecClassifier:
-    def __init__(self, model_name: str = "iic/emotion2vec_plus_large", device: str | None = None):
+    def __init__(self, model_name: str = DEFAULT_EMOTION_MODEL, device: str | None = None):
         try:
             from funasr import AutoModel
         except ImportError as exc:
             raise AnalysisError("缺少 FunASR，請先安裝 requirements.txt。") from exc
-        model_source = _prefer_local_model(
-            model_name,
-            LOCAL_EMOTION_MODEL,
-            {"iic/emotion2vec_plus_large", "emotion2vec_plus_large"},
-        )
+        model_source = _prefer_local_emotion_model(model_name)
         kwargs = {"model": model_source}
         if model_source == model_name:
             kwargs["hub"] = "ms"

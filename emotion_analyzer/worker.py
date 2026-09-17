@@ -7,7 +7,12 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .core import AnalysisConfig, BatchAnalyzer, DEFAULT_NOISE_REDUCTION_PROFILE
+from .core import (
+    AnalysisConfig,
+    BatchAnalyzer,
+    DEFAULT_EMOTION_MODEL,
+    DEFAULT_NOISE_REDUCTION_PROFILE,
+)
 
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
@@ -56,7 +61,7 @@ def _payload_to_config(payload: Mapping[str, object]) -> AnalysisConfig:
         match_threshold=float(payload["match_threshold"]),
         output_excel=Path(str(payload["output_excel"])),
         model_name=str(payload.get("model_name", "large-v3")),
-        emotion_model_name=str(payload.get("emotion_model_name", "iic/emotion2vec_plus_large")),
+        emotion_model_name=str(payload.get("emotion_model_name", DEFAULT_EMOTION_MODEL)),
         segment_padding_seconds=float(payload.get("segment_padding_seconds", 1.0)),
         noise_reduction_enabled=bool(payload.get("noise_reduction_enabled", True)),
         noise_reduction_profile=str(
