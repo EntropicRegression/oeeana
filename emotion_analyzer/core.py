@@ -132,6 +132,16 @@ class FileAnalysisResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class PreprocessResult:
+    """Files produced (or still required) by the cutting-only phase."""
+
+    source_files: tuple[Path, ...]
+    chopped_paths: tuple[Path, ...]
+    missing_paths: tuple[Path, ...]
+    errors: tuple[str, ...] = ()
+
+
 @dataclass
 class _TimedText:
     text: str
@@ -211,8 +221,26 @@ def _natural_key(path: Path) -> tuple:
 
 def enumerate_audio_files(directory: Path, recursive: bool = False) -> list[Path]:
     iterator: Iterable[Path] = directory.rglob("*") if recursive else directory.iterdir()
-    files = [p for p in iterator if p.is_file() and p.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS]
+    files = [
+        p
+        for p in iterator
+        if p.is_file()
+        and p.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+        and not any(
+            part.casefold() == "chopped"
+            for part in p.relative_to(directory).parts[:-1]
+        )
+    ]
     return sorted(files, key=_natural_key)
+
+
+def chopped_audio_paths(audio_path: Path, segment_count: int) -> tuple[Path, ...]:
+    """Return the stable paths accepted by both automatic and manual cutting."""
+    cache_dir = audio_path.parent / "chopped"
+    return tuple(
+        cache_dir / f"{audio_path.stem}_段落{index}.wav"
+        for index in range(1, segment_count + 1)
+    )
 
 
 def clear_chopped_directories(source_directories: Sequence[Path]) -> list[Path]:
@@ -757,8 +785,7 @@ class WhisperSegmenter:
 
     @staticmethod
     def _cache_paths(audio_path: Path, segment_count: int) -> list[Path]:
-        cache_dir = audio_path.parent / "chopped"
-        return [cache_dir / f"{audio_path.stem}_段落{index}.wav" for index in range(1, segment_count + 1)]
+        return list(chopped_audio_paths(audio_path, segment_count))
 
     @staticmethod
     def _cache_manifest_path(audio_path: Path) -> Path:
@@ -1063,7 +1090,33 @@ class BatchAnalyzer:
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
     ) -> list[list[FileAnalysisResult]]:
-        """Analyze one experiment spread across folders while loading each model once."""
+        """Run both phases for compatibility with the original one-click workflow."""
+        self.preprocess_many(
+            configs,
+            lambda value, message: self._report(progress, int(value * 0.45), message),
+            cancel_event,
+        )
+        return self.analyze_chopped_many(
+            configs,
+            lambda value, message: self._report(progress, 45 + int(value * 0.55), message),
+            cancel_event,
+        )
+
+    def preprocess(
+        self,
+        config: AnalysisConfig,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> PreprocessResult:
+        return self.preprocess_many([config], progress, cancel_event)
+
+    def preprocess_many(
+        self,
+        configs: Sequence[AnalysisConfig],
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> PreprocessResult:
+        """Denoise and cut WAVs, then stop so missing segments can be supplied manually."""
         if not configs:
             raise AnalysisError("至少需要一個待分析資料夾。")
         for config in configs:
@@ -1072,11 +1125,10 @@ class BatchAnalyzer:
 
         primary = configs[0]
         transcript_lines = read_transcript(primary.transcript_file, primary.segment_count)
-        reference = primary.reference_audio.resolve()
-        candidate_files: list[list[Path]] = []
-        for config in configs:
-            files = enumerate_audio_files(config.source_directory, config.recursive)
-            candidate_files.append([path for path in files if path.resolve() != reference])
+        reference, candidate_files = self._source_groups(configs)
+        source_files = self._unique_paths(
+            [reference, *(path for group in candidate_files for path in group)]
+        )
 
         created_whisper = self.whisper_segmenter is None
         if created_whisper:
@@ -1084,70 +1136,40 @@ class BatchAnalyzer:
         assert self.whisper_segmenter is not None
         release_whisper = created_whisper or isinstance(self.whisper_segmenter, WhisperSegmenter)
         paragraphs = [(line, line) for line in transcript_lines]
-        prepared_reference: tuple[Path, np.ndarray, list[SegmentedAudio]] | None = None
-        prepared_groups: list[list[tuple[Path, np.ndarray, list[SegmentedAudio]] | FileAnalysisResult]] = [
-            [] for _ in configs
-        ]
-        total_audio = 1 + sum(len(files) for files in candidate_files)
-        processed_audio = 0
-
-        # Friendly Support preprocesses every file first and releases Whisper before
-        # loading emotion2vec+. This avoids keeping both large models in GPU memory.
+        errors: list[str] = []
         try:
-            self._check_cancel(cancel_event)
-            self._report(progress, 0, f"預處理並切段標準音檔：{reference.name}")
-            try:
-                audio = preprocess_audio(
-                    reference,
-                    self.ffmpeg_path,
-                    noise_reduction_enabled=primary.noise_reduction_enabled,
-                    noise_reduction_profile=primary.noise_reduction_profile,
-                )
-                boundaries = self.whisper_segmenter.segment(
-                    reference,
-                    audio,
-                    paragraphs,
-                    primary.match_threshold,
-                    primary.segment_padding_seconds,
-                    self.ffmpeg_path,
-                    primary.noise_reduction_enabled,
-                    primary.noise_reduction_profile,
-                )
-            except AnalysisError as exc:
-                raise AnalysisError(f"標準音檔無法分段：{exc}") from exc
-            prepared_reference = (reference, audio, boundaries)
-            processed_audio += 1
-
-            for group_index, (config, files) in enumerate(zip(configs, candidate_files)):
-                folder_label = config.source_directory.name or str(config.source_directory)
-                for audio_path in files:
-                    self._check_cancel(cancel_event)
-                    percent = int(processed_audio * 45 / max(1, total_audio))
-                    self._report(progress, percent, f"預處理並切段 [{folder_label}]：{audio_path.name}")
-                    try:
-                        audio = preprocess_audio(
-                            audio_path,
-                            self.ffmpeg_path,
-                            noise_reduction_enabled=config.noise_reduction_enabled,
-                            noise_reduction_profile=config.noise_reduction_profile,
-                        )
-                        boundaries = self.whisper_segmenter.segment(
-                            audio_path,
-                            audio,
-                            paragraphs,
-                            config.match_threshold,
-                            config.segment_padding_seconds,
-                            self.ffmpeg_path,
-                            config.noise_reduction_enabled,
-                            config.noise_reduction_profile,
-                        )
-                    except AnalysisError as exc:
-                        prepared_groups[group_index].append(
-                            FileAnalysisResult(audio_path.name, error=str(exc))
-                        )
-                    else:
-                        prepared_groups[group_index].append((audio_path, audio, boundaries))
-                    processed_audio += 1
+            for index, audio_path in enumerate(source_files):
+                self._check_cancel(cancel_event)
+                percent = int(index * 100 / max(1, len(source_files)))
+                self._report(progress, percent, f"預處理並切段：{audio_path.name}")
+                try:
+                    audio = preprocess_audio(
+                        audio_path,
+                        self.ffmpeg_path,
+                        noise_reduction_enabled=primary.noise_reduction_enabled,
+                        noise_reduction_profile=primary.noise_reduction_profile,
+                    )
+                    boundaries = self.whisper_segmenter.segment(
+                        audio_path,
+                        audio,
+                        paragraphs,
+                        primary.match_threshold,
+                        primary.segment_padding_seconds,
+                        self.ffmpeg_path,
+                        primary.noise_reduction_enabled,
+                        primary.noise_reduction_profile,
+                    )
+                    for path, boundary in zip(
+                        chopped_audio_paths(audio_path, primary.segment_count), boundaries
+                    ):
+                        if not path.is_file() and boundary.audio is not None:
+                            _write_wav_file(path, boundary.audio)
+                        if boundary.error:
+                            errors.append(f"{path}: {boundary.error}")
+                except AnalysisError as exc:
+                    # A failed match is not fatal here: the user can add every
+                    # expected WAV manually before starting phase two.
+                    errors.append(f"{audio_path}: {exc}")
         finally:
             if release_whisper:
                 close = getattr(self.whisper_segmenter, "close", None)
@@ -1155,40 +1177,107 @@ class BatchAnalyzer:
                     close()
                 self.whisper_segmenter = None
 
+        chopped_paths = tuple(
+            path
+            for source in source_files
+            for path in chopped_audio_paths(source, primary.segment_count)
+        )
+        missing_paths = tuple(path for path in chopped_paths if not path.is_file())
+        self._report(
+            progress,
+            100,
+            f"切段完成；仍缺少 {len(missing_paths)} 個片段" if missing_paths else "切段完成",
+        )
+        return PreprocessResult(source_files, chopped_paths, missing_paths, tuple(errors))
+
+    def analyze_chopped(
+        self,
+        config: AnalysisConfig,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[FileAnalysisResult]:
+        return self.analyze_chopped_many([config], progress, cancel_event)[0]
+
+    def analyze_chopped_many(
+        self,
+        configs: Sequence[AnalysisConfig],
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[list[FileAnalysisResult]]:
+        """Analyze existing chopped WAVs without invoking preprocessing or Whisper."""
+        if not configs:
+            raise AnalysisError("至少需要一個待分析資料夾。")
+        for config in configs:
+            self._validate_config(config, require_transcript=False)
+        self._validate_shared_settings(configs)
+
+        primary = configs[0]
+        reference, candidate_files = self._source_groups(configs)
+        source_files = self._unique_paths(
+            [reference, *(path for group in candidate_files for path in group)]
+        )
+        missing_paths = self.missing_chopped_paths(configs)
+        if missing_paths:
+            listed = "\n".join(str(path) for path in missing_paths)
+            raise AnalysisError(f"尚缺少 {len(missing_paths)} 個切段音檔：\n{listed}")
+
+        loaded: dict[Path, list[SegmentedAudio]] = {}
+        for index, audio_path in enumerate(source_files):
+            self._check_cancel(cancel_event)
+            self._report(
+                progress,
+                int(index * 20 / max(1, len(source_files))),
+                f"讀取切段音檔：{audio_path.name}",
+            )
+            boundaries: list[SegmentedAudio] = []
+            for segment_index, path in enumerate(
+                chopped_audio_paths(audio_path, primary.segment_count)
+            ):
+                try:
+                    audio = decode_audio(path, self.ffmpeg_path)
+                except AnalysisError as exc:
+                    raise AnalysisError(f"無法讀取切段音檔 {path}：{exc}") from exc
+                boundaries.append(
+                    SegmentedAudio(
+                        segment_index,
+                        0.0,
+                        len(audio) / 16000.0,
+                        1.0,
+                        audio,
+                    )
+                )
+            loaded[audio_path.resolve()] = boundaries
+
         if self.emotion_classifier is None:
             self.emotion_classifier = Emotion2VecClassifier(primary.emotion_model_name)
 
-        assert prepared_reference is not None
-        reference_path, reference_audio, reference_boundaries = prepared_reference
-        self._report(progress, 45, f"分析標準音檔：{reference_path.name}")
+        self._report(progress, 20, f"分析標準音檔：{reference.name}")
         reference_segments = self._analyze_segments(
-            reference_audio, reference_boundaries, cancel_event, None
+            np.empty(0, dtype=np.float32), loaded[reference], cancel_event, None
         )
         if any(segment.error for segment in reference_segments):
             failed_indices = [str(segment.index + 1) for segment in reference_segments if segment.error]
             raise AnalysisError("標準音檔有無法分析的段落：" + ", ".join(failed_indices))
 
-        total_candidates = sum(len(group) for group in prepared_groups)
+        total_candidates = sum(len(group) for group in candidate_files)
         analyzed_candidates = 0
         all_results: list[list[FileAnalysisResult]] = []
-        for config, prepared in zip(configs, prepared_groups):
-            result_rows = [FileAnalysisResult(reference_path.name, segments=reference_segments)]
+        for config, files in zip(configs, candidate_files):
+            result_rows = [FileAnalysisResult(reference.name, segments=reference_segments)]
             folder_label = config.source_directory.name or str(config.source_directory)
-            for item in prepared:
+            for audio_path in files:
                 self._check_cancel(cancel_event)
-                if isinstance(item, FileAnalysisResult):
-                    result_rows.append(item)
-                else:
-                    audio_path, audio, boundaries = item
-                    percent = 45 + int(analyzed_candidates * 50 / max(1, total_candidates))
-                    self._report(progress, percent, f"分析 [{folder_label}]：{audio_path.name}")
-                    segments = self._analyze_segments(audio, boundaries, cancel_event, None)
-                    for segment in segments:
-                        reference_segment = reference_segments[segment.index]
-                        if segment.error is None and reference_segment.error is None:
-                            # Keep the reference vector private; Excel contains the requested top score only.
-                            segment.distance = l2_distance(segment.scores, reference_segment.scores)
-                    result_rows.append(FileAnalysisResult(audio_path.name, segments=segments))
+                percent = 20 + int(analyzed_candidates * 70 / max(1, total_candidates))
+                self._report(progress, percent, f"分析 [{folder_label}]：{audio_path.name}")
+                segments = self._analyze_segments(
+                    np.empty(0, dtype=np.float32), loaded[audio_path.resolve()], cancel_event, None
+                )
+                for segment in segments:
+                    reference_segment = reference_segments[segment.index]
+                    if segment.error is None and reference_segment.error is None:
+                        # Keep the reference vector private; Excel contains the requested top score only.
+                        segment.distance = l2_distance(segment.scores, reference_segment.scores)
+                result_rows.append(FileAnalysisResult(audio_path.name, segments=segments))
                 analyzed_candidates += 1
 
             self._write_excel(
@@ -1207,10 +1296,46 @@ class BatchAnalyzer:
                 },
             )
             all_results.append(result_rows)
-            self._report(progress, 95, f"已輸出：{config.output_excel}")
+            self._report(progress, 90, f"已輸出：{config.output_excel}")
 
         self._report(progress, 100, f"完成，共輸出 {len(configs)} 份 Excel")
         return all_results
+
+    def missing_chopped_paths(self, configs: Sequence[AnalysisConfig]) -> tuple[Path, ...]:
+        """List required phase-two inputs that do not currently exist."""
+        if not configs:
+            return ()
+        reference, candidate_files = self._source_groups(configs)
+        sources = self._unique_paths(
+            [reference, *(path for group in candidate_files for path in group)]
+        )
+        return tuple(
+            path
+            for source in sources
+            for path in chopped_audio_paths(source, configs[0].segment_count)
+            if not path.is_file()
+        )
+
+    @staticmethod
+    def _source_groups(configs: Sequence[AnalysisConfig]) -> tuple[Path, list[list[Path]]]:
+        reference = configs[0].reference_audio.resolve()
+        candidate_files: list[list[Path]] = []
+        for config in configs:
+            files = enumerate_audio_files(config.source_directory, config.recursive)
+            candidate_files.append([path.resolve() for path in files if path.resolve() != reference])
+        return reference, candidate_files
+
+    @staticmethod
+    def _unique_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            resolved = path.resolve()
+            key = str(resolved).casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(resolved)
+        return tuple(unique)
 
     @staticmethod
     def _validate_shared_settings(configs: Sequence[AnalysisConfig]) -> None:
@@ -1282,7 +1407,7 @@ class BatchAnalyzer:
         return results
 
     @staticmethod
-    def _validate_config(config: AnalysisConfig) -> None:
+    def _validate_config(config: AnalysisConfig, *, require_transcript: bool = True) -> None:
         if config.segment_count <= 0:
             raise AnalysisError("分段數量必須大於 0。")
         if not 0.0 <= config.match_threshold <= 1.0:
@@ -1296,7 +1421,7 @@ class BatchAnalyzer:
             raise AnalysisError(f"不支援的去雜音模式：{config.noise_reduction_profile}")
         if not config.reference_audio.is_file():
             raise AnalysisError("找不到標準音檔。")
-        if not config.transcript_file.is_file():
+        if require_transcript and not config.transcript_file.is_file():
             raise AnalysisError("找不到分段文字檔。")
         if not config.source_directory.is_dir():
             raise AnalysisError("找不到待分析資料夾。")

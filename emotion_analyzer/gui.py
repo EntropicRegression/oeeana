@@ -78,6 +78,10 @@ def run_gui() -> int:
             self.process_error_tail: list[str] = []
             self.process_failure_message: str | None = None
             self.analysis_outputs: list[str] = []
+            self.process_phase: str | None = None
+            self.completed_phase: str | None = None
+            self.missing_chopped_paths: list[str] = []
+            self.preprocess_errors: list[str] = []
             self.cancel_requested = False
             self.comparison_first_run = None
             self.comparison_second_run = None
@@ -125,11 +129,19 @@ def run_gui() -> int:
             self.status = QLabel("就緒")
             self.log = QPlainTextEdit()
             self.log.setReadOnly(True)
-            self.start_button = QPushButton("開始分析")
+            self.start_button = QPushButton("1. 切段音檔")
+            self.start_button.setToolTip("執行預處理與 Whisper 切段，不會開始情緒分析")
+            self.analyze_button = QPushButton("2. 開始情緒分析")
+            self.analyze_button.setToolTip("只讀取 chopped 中已備妥的片段並輸出 Excel")
             self.cancel_button = QPushButton("取消")
             self.cancel_button.setEnabled(False)
             self.reset_button = QPushButton("重置介面")
             self.reset_button.setToolTip("只清空介面，不會刪除音檔、切段快取或 Excel")
+            self.workflow_hint = QLabel(
+                "先執行切段；若記錄顯示缺失片段，請將人工切割 WAV 放入指定的 chopped 路徑，"
+                "再開始情緒分析。"
+            )
+            self.workflow_hint.setWordWrap(True)
 
             form = QFormLayout()
             form.addRow("標準音檔", self._picker_row(self.reference, self.pick_reference, "選擇音檔"))
@@ -158,9 +170,11 @@ def run_gui() -> int:
 
             buttons = QHBoxLayout()
             buttons.addWidget(self.start_button)
+            buttons.addWidget(self.analyze_button)
             buttons.addWidget(self.cancel_button)
             buttons.addWidget(self.reset_button)
-            self.start_button.clicked.connect(self.start_analysis)
+            self.start_button.clicked.connect(self.start_preprocessing)
+            self.analyze_button.clicked.connect(self.start_analysis)
             self.cancel_button.clicked.connect(self.cancel_analysis)
             self.reset_button.clicked.connect(self.reset_interface)
             self.transcript.editingFinished.connect(self.refresh_transcript_segment_count)
@@ -168,6 +182,7 @@ def run_gui() -> int:
             audio_tab = QWidget()
             audio_layout = QVBoxLayout(audio_tab)
             audio_layout.addLayout(form)
+            audio_layout.addWidget(self.workflow_hint)
             audio_layout.addLayout(buttons)
             audio_layout.addWidget(self.progress_bar)
             audio_layout.addWidget(self.status)
@@ -1235,22 +1250,24 @@ def run_gui() -> int:
             self.process_error_tail = []
             self.process_failure_message = None
             self.analysis_outputs = []
+            self.process_phase = None
+            self.completed_phase = None
+            self.missing_chopped_paths = []
+            self.preprocess_errors = []
             self.cancel_requested = False
 
-        def start_analysis(self):
-            if self.process is not None:
-                return
+        def _analysis_configs(self) -> list[AnalysisConfig] | None:
             reference_text = self.reference.text().strip()
             transcript_text = self.transcript.text().strip()
             sources = self._source_paths()
             if not reference_text or not transcript_text or not sources:
                 QMessageBox.warning(self, "資料不足", "請填寫標準音檔、分段文字檔並加入至少一個待分析資料夾。")
-                return
+                return None
             reference = Path(reference_text)
             transcript = Path(transcript_text)
             if not self.refresh_transcript_segment_count(show_error=True):
-                return
-            configs = [
+                return None
+            return [
                 AnalysisConfig(
                     reference_audio=reference,
                     segment_count=self.segment_count.value(),
@@ -1264,13 +1281,27 @@ def run_gui() -> int:
                 )
                 for source in sources
             ]
+
+        def start_preprocessing(self):
+            self._start_job("preprocess")
+
+        def start_analysis(self):
+            self._start_job("analyze")
+
+        def _start_job(self, phase: str):
+            if self.process is not None:
+                return
+            configs = self._analysis_configs()
+            if not configs:
+                return
             try:
-                self.job_file = create_job_file(configs)
+                self.job_file = create_job_file(configs, phase=phase)
             except Exception as exc:
                 QMessageBox.critical(self, "無法啟動分析", str(exc))
                 return
             self.log.clear()
             self.start_button.setEnabled(False)
+            self.analyze_button.setEnabled(False)
             self.cancel_button.setEnabled(True)
             self.reset_button.setEnabled(False)
             self.source_add_button.setEnabled(False)
@@ -1280,6 +1311,10 @@ def run_gui() -> int:
             self.process_error_tail = []
             self.process_failure_message = None
             self.analysis_outputs = []
+            self.process_phase = phase
+            self.completed_phase = None
+            self.missing_chopped_paths = []
+            self.preprocess_errors = []
             self.cancel_requested = False
             self.process = QProcess(self)
             self.process.setProgram(sys.executable)
@@ -1292,7 +1327,8 @@ def run_gui() -> int:
             self.process.readyReadStandardError.connect(self.read_process_stderr)
             self.process.errorOccurred.connect(self.on_process_error)
             self.process.finished.connect(self.on_process_finished)
-            self.status.setText(f"正在啟動批次分析，共 {len(configs)} 個資料夾…")
+            action = "音檔切段" if phase == "preprocess" else "情緒分析"
+            self.status.setText(f"正在啟動{action}，共 {len(configs)} 個資料夾…")
             self.process.start()
 
         def cancel_analysis(self):
@@ -1336,6 +1372,17 @@ def run_gui() -> int:
             elif event_name == "failed":
                 self.process_failure_message = str(event.get("message", "分析失敗"))
             elif event_name == "finished":
+                self.completed_phase = str(event.get("phase", self.process_phase or ""))
+                raw_missing = event.get("missing_chopped_paths")
+                if isinstance(raw_missing, list):
+                    self.missing_chopped_paths = [
+                        str(path) for path in raw_missing if str(path)
+                    ]
+                raw_errors = event.get("errors")
+                if isinstance(raw_errors, list):
+                    self.preprocess_errors = [
+                        str(error) for error in raw_errors if str(error)
+                    ]
                 raw_outputs = event.get("outputs")
                 if isinstance(raw_outputs, list):
                     self.analysis_outputs = [str(output) for output in raw_outputs if str(output)]
@@ -1362,6 +1409,7 @@ def run_gui() -> int:
                     pass
             self.job_file = None
             self.start_button.setEnabled(True)
+            self.analyze_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
             self.reset_button.setEnabled(True)
             self.source_add_button.setEnabled(True)
@@ -1369,8 +1417,33 @@ def run_gui() -> int:
             self.source_clear_button.setEnabled(True)
 
             if self.cancel_requested:
-                self.status.setText("分析已取消")
-                self.log.appendPlainText("分析已取消")
+                action = "切段" if self.process_phase == "preprocess" else "分析"
+                self.status.setText(f"{action}已取消")
+                self.log.appendPlainText(f"{action}已取消")
+                self.process_phase = None
+                return
+            completed_phase = self.completed_phase or self.process_phase
+            if exit_code == 0 and completed_phase == "preprocess":
+                self.progress_bar.setValue(100)
+                if self.missing_chopped_paths:
+                    self.status.setText("切段完成，等待補入缺失片段")
+                    if self.preprocess_errors:
+                        self.log.appendPlainText("\n切段期間發生下列問題：")
+                        for error in self.preprocess_errors:
+                            self.log.appendPlainText(error)
+                    self.log.appendPlainText("\n缺少下列切段 WAV：")
+                    for path in self.missing_chopped_paths:
+                        self.log.appendPlainText(path)
+                    message = (
+                        f"切段完成，尚缺 {len(self.missing_chopped_paths)} 個片段。\n\n"
+                        "請依記錄中的完整路徑放入人工切割 WAV，完成後按「2. 開始情緒分析」。"
+                    )
+                else:
+                    self.status.setText("切段完成，可開始情緒分析")
+                    message = "所有片段均已備妥，請按「2. 開始情緒分析」。"
+                self.log.appendPlainText(message)
+                QMessageBox.information(self, "切段完成", message)
+                self.process_phase = None
                 return
             if exit_code == 0 and self.analysis_outputs:
                 self.progress_bar.setValue(100)
@@ -1382,14 +1455,17 @@ def run_gui() -> int:
                     "完成",
                     f"分析完成，共輸出 {len(self.analysis_outputs)} 份 Excel：\n{output_text}",
                 )
+                self.process_phase = None
                 return
 
-            details = self.process_failure_message or "分析行程意外關閉"
+            action = "切段" if self.process_phase == "preprocess" else "分析"
+            details = self.process_failure_message or f"{action}行程意外關閉"
             if self.process_error_tail:
                 details += "\n\n最後的執行訊息：\n" + "\n".join(self.process_error_tail)
-            self.status.setText("分析失敗")
+            self.status.setText(f"{action}失敗")
             self.log.appendPlainText(details)
-            QMessageBox.critical(self, "分析失敗", details)
+            QMessageBox.critical(self, f"{action}失敗", details)
+            self.process_phase = None
 
         def closeEvent(self, event):
             if self.process and self.process.state() != QProcess.ProcessState.NotRunning:

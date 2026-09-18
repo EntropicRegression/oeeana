@@ -17,6 +17,7 @@ from .core import (
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
 EventSink = Callable[[dict[str, object]], None]
+JOB_PHASES = frozenset({"full", "preprocess", "analyze"})
 
 
 def _config_to_payload(config: AnalysisConfig) -> dict[str, object]:
@@ -36,15 +37,25 @@ def _config_to_payload(config: AnalysisConfig) -> dict[str, object]:
     }
 
 
-def create_job_file(config: AnalysisConfig | Sequence[AnalysisConfig]) -> Path:
+def create_job_file(
+    config: AnalysisConfig | Sequence[AnalysisConfig],
+    *,
+    phase: str = "full",
+) -> Path:
     """Serialize one or more analysis requests for the isolated model process."""
+    if phase not in JOB_PHASES:
+        raise ValueError(f"不支援的工作階段：{phase}")
     if isinstance(config, AnalysisConfig):
         payload: dict[str, object] = _config_to_payload(config)
+        payload["phase"] = phase
     else:
         configs = list(config)
         if not configs:
             raise ValueError("批次工作至少需要一個分析設定。")
-        payload = {"configs": [_config_to_payload(item) for item in configs]}
+        payload = {
+            "phase": phase,
+            "configs": [_config_to_payload(item) for item in configs],
+        }
     descriptor, raw_path = tempfile.mkstemp(prefix="oeeana-job-", suffix=".json")
     os.close(descriptor)
     path = Path(raw_path)
@@ -85,6 +96,17 @@ def load_job_files(path: Path) -> tuple[AnalysisConfig, ...]:
     return tuple(_payload_to_config(item) for item in raw_configs)
 
 
+def load_job_phase(path: Path) -> str:
+    """Load the requested phase while accepting legacy jobs as full runs."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("分析工作檔格式錯誤。")
+    phase = str(payload.get("phase", payload.get("mode", "full")))
+    if phase not in JOB_PHASES:
+        raise ValueError(f"不支援的工作階段：{phase}")
+    return phase
+
+
 def load_job_file(path: Path) -> AnalysisConfig:
     """Load the legacy single-config job format."""
     configs = load_job_files(path)
@@ -123,11 +145,18 @@ def run_job(
 
     try:
         configs = load_job_files(job_file)
+        phase = load_job_phase(job_file)
         analyzer = analyzer_factory()
         report_progress = lambda value, message: emit(
             {"event": "progress", "value": int(value), "message": str(message)}
         )
-        if len(configs) == 1:
+        if phase == "preprocess":
+            result = analyzer.preprocess_many(configs, report_progress)
+        elif phase == "analyze" and len(configs) == 1:
+            analyzer.analyze_chopped(configs[0], report_progress)
+        elif phase == "analyze":
+            analyzer.analyze_chopped_many(configs, report_progress)
+        elif len(configs) == 1:
             analyzer.run(configs[0], report_progress)
         else:
             analyzer.run_many(configs, report_progress)
@@ -135,8 +164,24 @@ def run_job(
         emit({"event": "failed", "message": str(exc)})
         return 1
 
+    if phase == "preprocess":
+        emit(
+            {
+                "event": "finished",
+                "phase": phase,
+                "chopped_paths": [str(path) for path in result.chopped_paths],
+                "missing_chopped_paths": [str(path) for path in result.missing_paths],
+                "errors": list(result.errors),
+            }
+        )
+        return 0
+
     outputs = [str(config.output_excel) for config in configs]
-    if len(outputs) == 1:
+    if phase == "analyze" and len(outputs) == 1:
+        emit({"event": "finished", "phase": phase, "output": outputs[0]})
+    elif phase == "analyze":
+        emit({"event": "finished", "phase": phase, "outputs": outputs})
+    elif len(outputs) == 1:
         emit({"event": "finished", "output": outputs[0]})
     else:
         emit({"event": "finished", "outputs": outputs})
