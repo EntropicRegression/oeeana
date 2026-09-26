@@ -14,6 +14,7 @@ from .core import (
     DEFAULT_NOISE_REDUCTION_PROFILE,
     PreprocessResult,
 )
+from .multi_reporting import write_multi_set_report
 
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
@@ -196,6 +197,37 @@ def _scaled_progress(
     return report
 
 
+def _set_name_from_output(path: Path, index: int) -> str:
+    stem = path.stem
+    prefix = "emotion_analysis_result_"
+    if stem.casefold().startswith(prefix.casefold()):
+        name = stem[len(prefix) :].strip()
+        if name:
+            return name
+    return f"part{index + 1}"
+
+
+def _combined_output_path(configs: Sequence[AnalysisConfig]) -> Path:
+    parents = [str(config.output_excel.resolve().parent) for config in configs]
+    try:
+        common = Path(os.path.commonpath(parents))
+    except ValueError:
+        common = configs[0].output_excel.resolve().parent
+    if common.exists() and common.is_file():
+        common = configs[0].output_excel.resolve().parent
+    return common / "emotion_analysis_result_combined.xlsx"
+
+
+def _write_combined_report(configs: Sequence[AnalysisConfig]) -> Path:
+    set_reports = [
+        (_set_name_from_output(config.output_excel, index), config.output_excel)
+        for index, config in enumerate(configs)
+    ]
+    output = _combined_output_path(configs)
+    write_multi_set_report(output, set_reports)
+    return output
+
+
 def run_job(
     job_file: Path,
     *,
@@ -210,6 +242,7 @@ def run_job(
         else:
             print(encode_event(event), flush=True)
 
+    combined_output: Path | None = None
     try:
         configs = load_job_files(job_file)
         phase = load_job_phase(job_file)
@@ -241,7 +274,7 @@ def run_job(
             total = len(configs)
 
             for index, config in enumerate(configs):
-                label = config.output_excel.stem
+                label = _set_name_from_output(config.output_excel, index)
                 report_progress = _scaled_progress(emit, index, total, label)
                 analyzer = analyzer_factory()
                 if phase == "preprocess":
@@ -264,6 +297,18 @@ def run_job(
                     tuple(missing_paths),
                     tuple(preprocess_errors),
                 )
+
+        # Different reference/transcript sets are a single multi-part experiment.
+        # Preserve each per-set report, then create one subject-level combined workbook.
+        if phase != "preprocess" and len(configs) > 1 and not compatible:
+            emit(
+                {
+                    "event": "progress",
+                    "value": 99,
+                    "message": "彙整 Analysis Set 總報表...",
+                }
+            )
+            combined_output = _write_combined_report(configs)
     except Exception as exc:
         emit({"event": "failed", "message": str(exc)})
         return 1
@@ -281,14 +326,14 @@ def run_job(
         return 0
 
     outputs = [str(config.output_excel) for config in configs]
-    if phase == "analyze" and len(outputs) == 1:
-        emit({"event": "finished", "phase": phase, "output": outputs[0]})
-    elif phase == "analyze":
-        emit({"event": "finished", "phase": phase, "outputs": outputs})
-    elif len(outputs) == 1:
-        emit({"event": "finished", "output": outputs[0]})
+    event: dict[str, object] = {"event": "finished", "phase": phase}
+    if len(outputs) == 1:
+        event["output"] = outputs[0]
     else:
-        emit({"event": "finished", "outputs": outputs})
+        event["outputs"] = outputs
+    if combined_output is not None:
+        event["combined_output"] = str(combined_output)
+    emit(event)
     return 0
 
 
