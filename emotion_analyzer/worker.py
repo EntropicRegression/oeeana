@@ -12,6 +12,7 @@ from .core import (
     BatchAnalyzer,
     DEFAULT_EMOTION_MODEL,
     DEFAULT_NOISE_REDUCTION_PROFILE,
+    PreprocessResult,
 )
 
 
@@ -140,6 +141,61 @@ def decode_event(line: str) -> dict[str, object] | None:
     return event if isinstance(event, dict) and isinstance(event.get("event"), str) else None
 
 
+def _batch_compatible(configs: Sequence[AnalysisConfig]) -> bool:
+    """Return True when the optimized shared-reference BatchAnalyzer path is valid."""
+    if len(configs) <= 1:
+        return True
+    primary = configs[0]
+    shared = (
+        primary.reference_audio.resolve(),
+        primary.transcript_file.resolve(),
+        primary.segment_count,
+        primary.match_threshold,
+        primary.model_name,
+        primary.emotion_model_name,
+        primary.segment_padding_seconds,
+        primary.noise_reduction_enabled,
+        primary.noise_reduction_profile,
+    )
+    return all(
+        (
+            config.reference_audio.resolve(),
+            config.transcript_file.resolve(),
+            config.segment_count,
+            config.match_threshold,
+            config.model_name,
+            config.emotion_model_name,
+            config.segment_padding_seconds,
+            config.noise_reduction_enabled,
+            config.noise_reduction_profile,
+        )
+        == shared
+        for config in configs[1:]
+    )
+
+
+def _scaled_progress(
+    emit: EventSink,
+    index: int,
+    total: int,
+    set_label: str,
+) -> Callable[[int, str], None]:
+    start = index * 100 / total
+    width = 100 / total
+
+    def report(value: int, message: str) -> None:
+        overall = int(start + max(0, min(100, value)) * width / 100)
+        emit(
+            {
+                "event": "progress",
+                "value": overall,
+                "message": f"[{set_label}] {message}",
+            }
+        )
+
+    return report
+
+
 def run_job(
     job_file: Path,
     *,
@@ -158,20 +214,56 @@ def run_job(
         configs = load_job_files(job_file)
         phase = load_job_phase(job_file)
         skip_missing = load_job_skip_missing(job_file)
-        analyzer = analyzer_factory()
-        report_progress = lambda value, message: emit(
-            {"event": "progress", "value": int(value), "message": str(message)}
-        )
-        if phase == "preprocess":
-            result = analyzer.preprocess_many(configs, report_progress)
-        elif phase == "analyze" and len(configs) == 1:
-            analyzer.analyze_chopped(configs[0], report_progress, skip_missing=skip_missing)
-        elif phase == "analyze":
-            analyzer.analyze_chopped_many(configs, report_progress, skip_missing=skip_missing)
-        elif len(configs) == 1:
-            analyzer.run(configs[0], report_progress)
+        compatible = _batch_compatible(configs)
+
+        if compatible:
+            analyzer = analyzer_factory()
+            report_progress = lambda value, message: emit(
+                {"event": "progress", "value": int(value), "message": str(message)}
+            )
+            if phase == "preprocess":
+                result = analyzer.preprocess_many(configs, report_progress)
+            elif phase == "analyze" and len(configs) == 1:
+                analyzer.analyze_chopped(configs[0], report_progress, skip_missing=skip_missing)
+            elif phase == "analyze":
+                analyzer.analyze_chopped_many(
+                    configs, report_progress, skip_missing=skip_missing
+                )
+            elif len(configs) == 1:
+                analyzer.run(configs[0], report_progress)
+            else:
+                analyzer.run_many(configs, report_progress)
         else:
-            analyzer.run_many(configs, report_progress)
+            source_files: list[Path] = []
+            chopped_paths: list[Path] = []
+            missing_paths: list[Path] = []
+            preprocess_errors: list[str] = []
+            total = len(configs)
+
+            for index, config in enumerate(configs):
+                label = config.output_excel.stem
+                report_progress = _scaled_progress(emit, index, total, label)
+                analyzer = analyzer_factory()
+                if phase == "preprocess":
+                    partial = analyzer.preprocess(config, report_progress)
+                    source_files.extend(partial.source_files)
+                    chopped_paths.extend(partial.chopped_paths)
+                    missing_paths.extend(partial.missing_paths)
+                    preprocess_errors.extend(partial.errors)
+                elif phase == "analyze":
+                    analyzer.analyze_chopped(
+                        config, report_progress, skip_missing=skip_missing
+                    )
+                else:
+                    analyzer.run(config, report_progress)
+
+            if phase == "preprocess":
+                result = PreprocessResult(
+                    tuple(source_files),
+                    tuple(chopped_paths),
+                    tuple(missing_paths),
+                    tuple(preprocess_errors),
+                )
     except Exception as exc:
         emit({"event": "failed", "message": str(exc)})
         return 1
