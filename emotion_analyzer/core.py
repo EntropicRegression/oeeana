@@ -1089,6 +1089,8 @@ class BatchAnalyzer:
         configs: Sequence[AnalysisConfig],
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        *,
+        skip_missing: bool = False,
     ) -> list[list[FileAnalysisResult]]:
         """Run both phases for compatibility with the original one-click workflow."""
         self.preprocess_many(
@@ -1100,6 +1102,7 @@ class BatchAnalyzer:
             configs,
             lambda value, message: self._report(progress, 45 + int(value * 0.55), message),
             cancel_event,
+            skip_missing=skip_missing,
         )
 
     def preprocess(
@@ -1195,14 +1198,18 @@ class BatchAnalyzer:
         config: AnalysisConfig,
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        *,
+        skip_missing: bool = False,
     ) -> list[FileAnalysisResult]:
-        return self.analyze_chopped_many([config], progress, cancel_event)[0]
+        return self.analyze_chopped_many([config], progress, cancel_event, skip_missing=skip_missing)[0]
 
     def analyze_chopped_many(
         self,
         configs: Sequence[AnalysisConfig],
         progress: ProgressCallback | None = None,
         cancel_event: threading.Event | None = None,
+        *,
+        skip_missing: bool = False,
     ) -> list[list[FileAnalysisResult]]:
         """Analyze existing chopped WAVs without invoking preprocessing or Whisper."""
         if not configs:
@@ -1217,9 +1224,10 @@ class BatchAnalyzer:
             [reference, *(path for group in candidate_files for path in group)]
         )
         missing_paths = self.missing_chopped_paths(configs)
-        if missing_paths:
+        if missing_paths and not skip_missing:
             listed = "\n".join(str(path) for path in missing_paths)
             raise AnalysisError(f"尚缺少 {len(missing_paths)} 個切段音檔：\n{listed}")
+        missing_set = {str(p.resolve()).casefold() for p in missing_paths}
 
         loaded: dict[Path, list[SegmentedAudio]] = {}
         for index, audio_path in enumerate(source_files):
@@ -1233,6 +1241,18 @@ class BatchAnalyzer:
             for segment_index, path in enumerate(
                 chopped_audio_paths(audio_path, primary.segment_count)
             ):
+                if str(path.resolve()).casefold() in missing_set:
+                    boundaries.append(
+                        SegmentedAudio(
+                            segment_index,
+                            math.nan,
+                            math.nan,
+                            0.0,
+                            None,
+                            error=f"缺少切段音檔：{path.name}",
+                        )
+                    )
+                    continue
                 try:
                     audio = decode_audio(path, self.ffmpeg_path)
                 except AnalysisError as exc:

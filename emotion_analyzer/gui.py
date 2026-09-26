@@ -12,8 +12,10 @@ from .analytics import (
 )
 from .core import (
     AnalysisConfig,
+    BatchAnalyzer,
     DEFAULT_EMOTION_MODEL,
     EMOTION_MODEL_OPTIONS,
+    chopped_audio_paths,
     clear_chopped_directories,
     read_transcript,
 )
@@ -1286,16 +1288,40 @@ def run_gui() -> int:
             self._start_job("preprocess")
 
         def start_analysis(self):
-            self._start_job("analyze")
+            configs = self._analysis_configs()
+            if not configs:
+                return
+            try:
+                analyzer = BatchAnalyzer()
+                missing = analyzer.missing_chopped_paths(configs)
+            except Exception as exc:
+                QMessageBox.critical(self, "檢查失敗", str(exc))
+                return
+            skip_missing = False
+            if missing:
+                listed = "\n".join(str(p) for p in missing[:20])
+                extra = f"\n…共 {len(missing)} 個" if len(missing) > 20 else ""
+                answer = QMessageBox.question(
+                    self,
+                    "缺少切段音檔",
+                    f"尚缺少 {len(missing)} 個切段音檔：\n{listed}{extra}\n\n"
+                    "缺少的段落將標記為「分段失敗」並跳過。\n是否繼續分析？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                skip_missing = True
+            self._start_job("analyze", skip_missing=skip_missing)
 
-        def _start_job(self, phase: str):
+        def _start_job(self, phase: str, *, skip_missing: bool = False):
             if self.process is not None:
                 return
             configs = self._analysis_configs()
             if not configs:
                 return
             try:
-                self.job_file = create_job_file(configs, phase=phase)
+                self.job_file = create_job_file(configs, phase=phase, skip_missing=skip_missing)
             except Exception as exc:
                 QMessageBox.critical(self, "無法啟動分析", str(exc))
                 return

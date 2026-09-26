@@ -41,6 +41,7 @@ def create_job_file(
     config: AnalysisConfig | Sequence[AnalysisConfig],
     *,
     phase: str = "full",
+    skip_missing: bool = False,
 ) -> Path:
     """Serialize one or more analysis requests for the isolated model process."""
     if phase not in JOB_PHASES:
@@ -56,6 +57,8 @@ def create_job_file(
             "phase": phase,
             "configs": [_config_to_payload(item) for item in configs],
         }
+    if skip_missing:
+        payload["skip_missing"] = True
     descriptor, raw_path = tempfile.mkstemp(prefix="oeeana-job-", suffix=".json")
     os.close(descriptor)
     path = Path(raw_path)
@@ -107,6 +110,14 @@ def load_job_phase(path: Path) -> str:
     return phase
 
 
+def load_job_skip_missing(path: Path) -> bool:
+    """Load the skip_missing flag from the job file."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("skip_missing", False))
+
+
 def load_job_file(path: Path) -> AnalysisConfig:
     """Load the legacy single-config job format."""
     configs = load_job_files(path)
@@ -146,6 +157,7 @@ def run_job(
     try:
         configs = load_job_files(job_file)
         phase = load_job_phase(job_file)
+        skip_missing = load_job_skip_missing(job_file)
         analyzer = analyzer_factory()
         report_progress = lambda value, message: emit(
             {"event": "progress", "value": int(value), "message": str(message)}
@@ -153,9 +165,9 @@ def run_job(
         if phase == "preprocess":
             result = analyzer.preprocess_many(configs, report_progress)
         elif phase == "analyze" and len(configs) == 1:
-            analyzer.analyze_chopped(configs[0], report_progress)
+            analyzer.analyze_chopped(configs[0], report_progress, skip_missing=skip_missing)
         elif phase == "analyze":
-            analyzer.analyze_chopped_many(configs, report_progress)
+            analyzer.analyze_chopped_many(configs, report_progress, skip_missing=skip_missing)
         elif len(configs) == 1:
             analyzer.run(configs[0], report_progress)
         else:
