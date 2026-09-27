@@ -1,62 +1,62 @@
 from __future__ import annotations
 
-import re
+import math
 from pathlib import Path
 from typing import Sequence
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+import numpy as np
 
-from .analytics import RunAnalysis, SegmentObservation, make_run_analysis
-from .reporting import (
-    _save_atomic,
-    _write_info_sheet,
-    _write_raw_sheet,
-    _write_summary_sheet,
-    read_run_report,
+from .analytics import EMOTION_LABELS, RunAnalysis, normalize_subject_id
+from .core import (
+    AnalysisConfig,
+    FileAnalysisResult,
+    SegmentResult,
+    enumerate_audio_files,
 )
-
-
-HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
-HEADER_FONT = Font(name="Arial", size=10, color="FFFFFF", bold=True)
-BODY_FONT = Font(name="Arial", size=10, color="1F1F1F")
-TITLE_FONT = Font(name="Arial", size=14, bold=True, color="1F1F1F")
+from .reporting import read_run_report, write_run_report
 
 
 class MultiSetReportError(ValueError):
     """Raised when per-set reports cannot be combined safely."""
 
 
-def _style_header(worksheet, row: int, first_column: int, last_column: int) -> None:
-    for column in range(first_column, last_column + 1):
-        cell = worksheet.cell(row, column)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+def _placeholder_segment(index: int, error: str) -> SegmentResult:
+    return SegmentResult(
+        index=index,
+        start=math.nan,
+        end=math.nan,
+        confidence=0.0,
+        scores=np.zeros(len(EMOTION_LABELS), dtype=np.float64),
+        emotion="分析失敗",
+        top_score=math.nan,
+        error=error,
+        distance=math.nan,
+    )
 
 
-def _fit_columns(worksheet, maximum: int = 36) -> None:
-    for column_cells in worksheet.columns:
-        for cell in column_cells:
-            if cell.value is not None:
-                cell.font = cell.font.copy(name="Arial") if cell.font else BODY_FONT
-        letter = get_column_letter(column_cells[0].column)
-        width = max(10, max(len(str(cell.value or "")) for cell in column_cells) + 2)
-        worksheet.column_dimensions[letter].width = min(maximum, width)
-
-
-def _safe_sheet_name(value: str, used: set[str]) -> str:
-    cleaned = re.sub(r"[\\/*?:\[\]]+", "_", value).strip() or "Set"
-    base = cleaned[:31]
-    candidate = base
-    suffix = 2
-    while candidate.casefold() in used:
-        tail = f"_{suffix}"
-        candidate = base[: 31 - len(tail)] + tail
-        suffix += 1
-    used.add(candidate.casefold())
-    return candidate
+def _observation_to_segment(observation, index: int) -> SegmentResult:
+    scores = (
+        np.asarray(observation.scores, dtype=np.float64)
+        if observation.scores is not None
+        else np.zeros(len(EMOTION_LABELS), dtype=np.float64)
+    )
+    return SegmentResult(
+        index=index,
+        start=observation.start if observation.start is not None else math.nan,
+        end=observation.end if observation.end is not None else math.nan,
+        confidence=(
+            observation.confidence if observation.confidence is not None else 0.0
+        ),
+        scores=scores,
+        emotion=observation.main_emotion or ("分析失敗" if observation.error else ""),
+        top_score=(observation.top_score if observation.top_score is not None else math.nan),
+        error=observation.error,
+        distance=(
+            observation.l2_distance
+            if observation.l2_distance is not None
+            else math.nan
+        ),
+    )
 
 
 def _subject_map(run: RunAnalysis, set_name: str):
@@ -74,10 +74,43 @@ def _subject_map(run: RunAnalysis, set_name: str):
     return subjects
 
 
-def build_multi_set_analysis(
+def _reference_subject(run: RunAnalysis):
+    return next((subject for subject in run.subjects if subject.is_reference), None)
+
+
+def _segments_for_subject(
+    subject,
+    segment_count: int,
+    global_offset: int,
+    missing_error: str,
+) -> list[SegmentResult]:
+    if subject is None:
+        return [
+            _placeholder_segment(global_offset + local_index, missing_error)
+            for local_index in range(segment_count)
+        ]
+
+    by_index = {segment.segment_index: segment for segment in subject.segments}
+    results: list[SegmentResult] = []
+    for local_index in range(1, segment_count + 1):
+        global_index = global_offset + local_index - 1
+        observation = by_index.get(local_index)
+        if observation is None:
+            results.append(
+                _placeholder_segment(
+                    global_index,
+                    f"缺少第 {local_index} 段分析結果",
+                )
+            )
+        else:
+            results.append(_observation_to_segment(observation, global_index))
+    return results
+
+
+def build_flattened_rows(
     set_reports: Sequence[tuple[str, Path]],
-) -> tuple[RunAnalysis, tuple[tuple[str, RunAnalysis], ...]]:
-    """Represent each Analysis Set mean as one high-level segment per subject."""
+) -> tuple[list[FileAnalysisResult], int, tuple[tuple[str, RunAnalysis], ...]]:
+    """Flatten part1..N into the original single-run row/segment structure."""
     if not set_reports:
         raise MultiSetReportError("至少需要一份 Analysis Set 報表。")
 
@@ -88,7 +121,7 @@ def build_multi_set_analysis(
         raise MultiSetReportError("Analysis Set 名稱不可重複。")
 
     loaded: list[tuple[str, RunAnalysis]] = []
-    maps: list[dict[str, object]] = []
+    subject_maps: list[dict[str, object]] = []
     subject_order: list[str] = []
     seen_subjects: set[str] = set()
 
@@ -96,205 +129,124 @@ def build_multi_set_analysis(
         run = read_run_report(Path(report_path))
         loaded.append((set_name, run))
         subject_map = _subject_map(run, set_name)
-        maps.append(subject_map)
+        subject_maps.append(subject_map)
         for subject in run.comparison_subjects:
             if subject.subject_id not in seen_subjects:
                 seen_subjects.add(subject.subject_id)
                 subject_order.append(subject.subject_id)
 
-    observations: list[SegmentObservation] = []
-    ordered_subjects: list[tuple[str, str, bool, str | None]] = []
+    total_segment_count = sum(run.segment_count for _, run in loaded)
+    if total_segment_count <= 0:
+        raise MultiSetReportError("合併報表沒有任何可用段落。")
+
+    reference_segments: list[SegmentResult] = []
+    offset = 0
+    for set_name, run in loaded:
+        reference = _reference_subject(run)
+        reference_segments.extend(
+            _segments_for_subject(
+                reference,
+                run.segment_count,
+                offset,
+                f"{set_name}：缺少標準音檔分析結果",
+            )
+        )
+        offset += run.segment_count
+
+    rows: list[FileAnalysisResult] = [
+        FileAnalysisResult("標準音檔", segments=reference_segments)
+    ]
 
     for subject_id in subject_order:
         first_subject = next(
             (
                 subject_map[subject_id]
-                for subject_map in maps
+                for subject_map in subject_maps
                 if subject_id in subject_map
             ),
             None,
         )
         audio_name = (
             getattr(first_subject, "audio_name", None)
-            or f"{subject_id}-combined"
+            or f"{subject_id}-combined.wav"
         )
-        ordered_subjects.append((subject_id, str(audio_name), False, None))
-
-        for set_index, ((set_name, _run), subject_map) in enumerate(
-            zip(loaded, maps), 1
-        ):
+        segments: list[SegmentResult] = []
+        offset = 0
+        for (set_name, run), subject_map in zip(loaded, subject_maps):
             subject = subject_map.get(subject_id)
-            if subject is None:
-                observations.append(
-                    SegmentObservation(
-                        subject_id=subject_id,
-                        audio_name=str(audio_name),
-                        is_reference=False,
-                        segment_index=set_index,
-                        error=f"缺少 Analysis Set：{set_name}",
-                    )
-                )
-                continue
-
-            mean_l1 = getattr(subject, "mean_l1", None)
-            mean_l2 = getattr(subject, "mean_l2", None)
-            error = getattr(subject, "error", None)
-            if mean_l1 is None and mean_l2 is None and not error:
-                error = f"Analysis Set {set_name} 沒有有效距離數值"
-            observations.append(
-                SegmentObservation(
-                    subject_id=subject_id,
-                    audio_name=str(audio_name),
-                    is_reference=False,
-                    segment_index=set_index,
-                    l1_distance=mean_l1,
-                    l2_distance=mean_l2,
-                    error=error,
+            segments.extend(
+                _segments_for_subject(
+                    subject,
+                    run.segment_count,
+                    offset,
+                    f"{set_name}：缺少來源音檔",
                 )
             )
+            offset += run.segment_count
+        rows.append(FileAnalysisResult(str(audio_name), segments=segments))
 
-    analysis = make_run_analysis(
-        observations,
-        "MULTI_SET",
-        "oeeana-multi-set",
-        subject_order=ordered_subjects,
-    )
-    return analysis, tuple(loaded)
+    return rows, total_segment_count, tuple(loaded)
 
 
-def _write_overview(
-    workbook: Workbook,
-    analysis: RunAnalysis,
-    set_names: Sequence[str],
+def write_failed_set_report(
+    path: Path,
+    config: AnalysisConfig,
+    error: str,
 ) -> None:
-    worksheet = workbook.active
-    worksheet.title = "整體摘要"
-    worksheet.sheet_view.showGridLines = False
-    worksheet["A2"] = "多段 Analysis Set 整體摘要"
-    worksheet["A2"].font = TITLE_FONT
-    worksheet["A3"] = "Overall 為各 Analysis Set 平均值的等權平均。"
-    worksheet["A3"].font = Font(name="Arial", size=10, italic=True, color="666666")
-
-    headers = ["受試者", "有效 Set 數"]
-    for set_name in set_names:
-        headers.extend([f"{set_name} L1", f"{set_name} L2"])
-    headers.extend(["Overall L1", "Overall L2", "缺失/錯誤 Set"])
-    header_row = 5
-    for column, value in enumerate(headers, 1):
-        worksheet.cell(header_row, column, value)
-    _style_header(worksheet, header_row, 1, len(headers))
-
-    for subject in analysis.comparison_subjects:
-        by_index = {segment.segment_index: segment for segment in subject.segments}
-        values: list[object] = [subject.subject_id, subject.valid_segments]
-        issues: list[str] = []
-        for index, set_name in enumerate(set_names, 1):
-            segment = by_index.get(index)
-            values.extend(
-                [
-                    segment.l1_distance if segment else None,
-                    segment.l2_distance if segment else None,
-                ]
-            )
-            if segment is None or segment.error:
-                issues.append(set_name)
-        values.extend(
-            [
-                subject.mean_l1,
-                subject.mean_l2,
-                "、".join(issues) if issues else None,
-            ]
-        )
-        worksheet.append(values)
-
-    worksheet.freeze_panes = "A6"
-    worksheet.auto_filter.ref = worksheet.dimensions
-    for row in worksheet.iter_rows(min_row=header_row + 1):
-        for cell in row[2:-1]:
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = "0.000000"
-    _fit_columns(worksheet, maximum=28)
-
-
-def _write_set_sheet(workbook: Workbook, set_name: str, run: RunAnalysis, used: set[str]) -> None:
-    worksheet = workbook.create_sheet(_safe_sheet_name(set_name, used))
-    worksheet.sheet_view.showGridLines = False
-    worksheet["A2"] = f"Analysis Set：{set_name}"
-    worksheet["A2"].font = TITLE_FONT
-    headers = [
-        "受試者",
-        "音檔名稱",
-        "有效段數",
-        "L1平均截距",
-        "L1總計截距",
-        "L2平均差距",
-        "L2總計差距",
-        "錯誤",
+    """Create a valid original-format report for a failed Set so the experiment can continue."""
+    message = f"Analysis Set 分析失敗：{error}"
+    reference_segments = [
+        _placeholder_segment(index, message) for index in range(config.segment_count)
     ]
-    header_row = 4
-    for column, value in enumerate(headers, 1):
-        worksheet.cell(header_row, column, value)
-    _style_header(worksheet, header_row, 1, len(headers))
-    for subject in run.comparison_subjects:
-        worksheet.append(
-            [
-                subject.subject_id,
-                subject.audio_name,
-                subject.valid_segments,
-                subject.mean_l1,
-                subject.total_l1,
-                subject.mean_l2,
-                subject.total_l2,
-                subject.error,
-            ]
-        )
-    worksheet.freeze_panes = "A5"
-    worksheet.auto_filter.ref = worksheet.dimensions
-    for row in worksheet.iter_rows(min_row=header_row + 1):
-        for cell in row[3:7]:
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = "0.000000"
-    _fit_columns(worksheet)
+    rows: list[FileAnalysisResult] = [
+        FileAnalysisResult(config.reference_audio.name or "標準音檔", segments=reference_segments)
+    ]
 
+    try:
+        candidates = enumerate_audio_files(config.source_directory, config.recursive)
+    except Exception:
+        candidates = []
+    reference = config.reference_audio.resolve()
+    for audio_path in candidates:
+        if audio_path.resolve() == reference:
+            continue
+        segments = [
+            _placeholder_segment(index, message) for index in range(config.segment_count)
+        ]
+        rows.append(FileAnalysisResult(audio_path.name, segments=segments, error=message))
 
-def _write_set_index(workbook: Workbook, loaded: Sequence[tuple[str, RunAnalysis]]) -> None:
-    worksheet = workbook.create_sheet("Set對照")
-    worksheet.append(["高階段落", "Analysis Set", "原始段落數", "標準音檔"])
-    _style_header(worksheet, 1, 1, 4)
-    for index, (set_name, run) in enumerate(loaded, 1):
-        worksheet.append([index, set_name, run.segment_count, run.reference_audio])
-    worksheet.freeze_panes = "A2"
-    _fit_columns(worksheet, maximum=48)
+    write_run_report(
+        Path(path),
+        rows,
+        config.segment_count,
+        {
+            "report_type": "failed_analysis_set",
+            "set_error": error,
+        },
+    )
 
 
 def write_multi_set_report(
     path: Path,
     set_reports: Sequence[tuple[str, Path]],
 ) -> RunAnalysis:
-    """Combine per-set reports into one subject-level report readable by the comparison UI."""
-    analysis, loaded = build_multi_set_analysis(set_reports)
-    workbook = Workbook()
-    set_names = [name for name, _ in loaded]
-    _write_overview(workbook, analysis, set_names)
-
-    used = {"整體摘要".casefold()}
+    """Write one workbook with exactly the original single-run report layout."""
+    rows, total_segment_count, loaded = build_flattened_rows(set_reports)
+    set_map_parts: list[str] = []
+    offset = 1
     for set_name, run in loaded:
-        _write_set_sheet(workbook, set_name, run, used)
-    _write_set_index(workbook, loaded)
+        end = offset + run.segment_count - 1
+        set_map_parts.append(f"{set_name}:{offset}-{end}")
+        offset = end + 1
 
-    # These standard sheets keep the combined workbook compatible with read_run_report()
-    # and therefore with the existing pre/post comparison interface.
-    _write_summary_sheet(workbook, analysis)
-    _write_raw_sheet(workbook, analysis)
-    _write_info_sheet(
-        workbook,
-        analysis,
+    return write_run_report(
+        Path(path),
+        rows,
+        total_segment_count,
         {
-            "report_type": "multi_set_run_analysis",
+            "report_type": "multi_set_flattened_run_analysis",
             "analysis_set_count": len(loaded),
-            "analysis_sets": " | ".join(set_names),
-            "overall_aggregation": "equal_weight_mean_of_set_means",
+            "analysis_sets": " | ".join(name for name, _ in loaded),
+            "analysis_set_segment_map": " | ".join(set_map_parts),
         },
     )
-    _save_atomic(workbook, Path(path))
-    return analysis
