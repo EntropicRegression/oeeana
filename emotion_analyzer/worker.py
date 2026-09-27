@@ -14,7 +14,7 @@ from .core import (
     DEFAULT_NOISE_REDUCTION_PROFILE,
     PreprocessResult,
 )
-from .multi_reporting import write_multi_set_report
+from .multi_reporting import write_failed_set_report, write_multi_set_report
 
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
@@ -215,7 +215,7 @@ def _combined_output_path(configs: Sequence[AnalysisConfig]) -> Path:
         common = configs[0].output_excel.resolve().parent
     if common.exists() and common.is_file():
         common = configs[0].output_excel.resolve().parent
-    return common / "emotion_analysis_result_combined.xlsx"
+    return common / "emotion_analysis_result.xlsx"
 
 
 def _write_combined_report(configs: Sequence[AnalysisConfig]) -> Path:
@@ -226,6 +226,17 @@ def _write_combined_report(configs: Sequence[AnalysisConfig]) -> Path:
     output = _combined_output_path(configs)
     write_multi_set_report(output, set_reports)
     return output
+
+
+def _remove_set_reports(configs: Sequence[AnalysisConfig], combined_output: Path) -> None:
+    combined_key = str(combined_output.resolve()).casefold()
+    for config in configs:
+        path = config.output_excel
+        try:
+            if str(path.resolve()).casefold() != combined_key:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def run_job(
@@ -243,11 +254,16 @@ def run_job(
             print(encode_event(event), flush=True)
 
     combined_output: Path | None = None
+    set_errors: list[str] = []
     try:
         configs = load_job_files(job_file)
         phase = load_job_phase(job_file)
-        skip_missing = load_job_skip_missing(job_file)
+        requested_skip_missing = load_job_skip_missing(job_file)
         compatible = _batch_compatible(configs)
+        multi_set = len(configs) > 1 and not compatible
+        # Multi-set experiments are tolerant by design. Missing chopped audio becomes
+        # an error cell in the final report instead of aborting the whole experiment.
+        skip_missing = requested_skip_missing or multi_set
 
         if compatible:
             analyzer = analyzer_factory()
@@ -257,7 +273,9 @@ def run_job(
             if phase == "preprocess":
                 result = analyzer.preprocess_many(configs, report_progress)
             elif phase == "analyze" and len(configs) == 1:
-                analyzer.analyze_chopped(configs[0], report_progress, skip_missing=skip_missing)
+                analyzer.analyze_chopped(
+                    configs[0], report_progress, skip_missing=skip_missing
+                )
             elif phase == "analyze":
                 analyzer.analyze_chopped_many(
                     configs, report_progress, skip_missing=skip_missing
@@ -265,7 +283,7 @@ def run_job(
             elif len(configs) == 1:
                 analyzer.run(configs[0], report_progress)
             else:
-                analyzer.run_many(configs, report_progress)
+                analyzer.run_many(configs, report_progress, skip_missing=skip_missing)
         else:
             source_files: list[Path] = []
             chopped_paths: list[Path] = []
@@ -283,12 +301,32 @@ def run_job(
                     chopped_paths.extend(partial.chopped_paths)
                     missing_paths.extend(partial.missing_paths)
                     preprocess_errors.extend(partial.errors)
-                elif phase == "analyze":
-                    analyzer.analyze_chopped(
-                        config, report_progress, skip_missing=skip_missing
+                    continue
+
+                try:
+                    if phase == "analyze":
+                        analyzer.analyze_chopped(
+                            config,
+                            report_progress,
+                            skip_missing=True,
+                        )
+                    else:
+                        analyzer.run(
+                            config,
+                            report_progress,
+                        )
+                except Exception as exc:
+                    # One damaged/missing Set must not prevent the rest of the experiment.
+                    message = f"[{label}] {exc}"
+                    set_errors.append(message)
+                    emit(
+                        {
+                            "event": "progress",
+                            "value": int((index + 1) * 100 / total),
+                            "message": message + "；已記錄並繼續。",
+                        }
                     )
-                else:
-                    analyzer.run(config, report_progress)
+                    write_failed_set_report(config.output_excel, config, str(exc))
 
             if phase == "preprocess":
                 result = PreprocessResult(
@@ -298,17 +336,16 @@ def run_job(
                     tuple(preprocess_errors),
                 )
 
-        # Different reference/transcript sets are a single multi-part experiment.
-        # Preserve each per-set report, then create one subject-level combined workbook.
-        if phase != "preprocess" and len(configs) > 1 and not compatible:
+        if phase != "preprocess" and multi_set:
             emit(
                 {
                     "event": "progress",
                     "value": 99,
-                    "message": "彙整 Analysis Set 總報表...",
+                    "message": "彙整單一實驗報表...",
                 }
             )
             combined_output = _write_combined_report(configs)
+            _remove_set_reports(configs, combined_output)
     except Exception as exc:
         emit({"event": "failed", "message": str(exc)})
         return 1
@@ -325,14 +362,23 @@ def run_job(
         )
         return 0
 
+    if combined_output is not None:
+        event: dict[str, object] = {
+            "event": "finished",
+            "phase": phase,
+            "output": str(combined_output),
+        }
+        if set_errors:
+            event["errors"] = set_errors
+        emit(event)
+        return 0
+
     outputs = [str(config.output_excel) for config in configs]
-    event: dict[str, object] = {"event": "finished", "phase": phase}
+    event = {"event": "finished", "phase": phase}
     if len(outputs) == 1:
         event["output"] = outputs[0]
     else:
         event["outputs"] = outputs
-    if combined_output is not None:
-        event["combined_output"] = str(combined_output)
     emit(event)
     return 0
 
