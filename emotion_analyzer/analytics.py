@@ -186,6 +186,18 @@ class GroupEffectTestResult:
 
 
 @dataclass(frozen=True)
+class AncovaHomogeneityTestResult:
+    experimental_count: int
+    control_count: int
+    f_statistic: float | None
+    numerator_degrees_freedom: float | None
+    denominator_degrees_freedom: float | None
+    p_value: float | None
+    homogeneous: bool | None
+    note: str
+
+
+@dataclass(frozen=True)
 class ExperimentComparison:
     metric: DistanceMetric
     pairing_mode: PairingMode
@@ -193,6 +205,7 @@ class ExperimentComparison:
     overall: ComparisonStatistics
     groups: tuple[ComparisonStatistics, ...]
     group_effect_tests: tuple[GroupEffectTestResult, ...]
+    ancova_homogeneity_test: AncovaHomogeneityTestResult
     first_source: str = "第一次實驗"
     second_source: str = "第二次實驗"
     first_files: tuple[str, ...] = ()
@@ -701,6 +714,76 @@ def _ancova_test(rows: Sequence[ComparisonRow]) -> GroupEffectTestResult:
     )
 
 
+def _ancova_homogeneity_test(rows: Sequence[ComparisonRow]) -> AncovaHomogeneityTestResult:
+    experimental, control, _, _ = _group_change_context(rows)
+
+    def unavailable(note: str) -> AncovaHomogeneityTestResult:
+        return AncovaHomogeneityTestResult(
+            experimental_count=len(experimental),
+            control_count=len(control),
+            f_statistic=None,
+            numerator_degrees_freedom=None,
+            denominator_degrees_freedom=None,
+            p_value=None,
+            homogeneous=None,
+            note=note,
+        )
+
+    if len(experimental) < 2 or len(control) < 2:
+        return unavailable("實驗組與對照組各至少需要 2 筆有效成對資料。")
+
+    paired_rows = [*experimental, *control]
+    outcomes = np.asarray([row.second_value for row in paired_rows], dtype=float)
+    baselines = np.asarray([row.first_value for row in paired_rows], dtype=float)
+    groups = np.asarray(
+        [1.0 if row.group == "實驗組" else 0.0 for row in paired_rows], dtype=float
+    )
+    reduced_design = np.column_stack((np.ones(len(paired_rows)), baselines, groups))
+    full_design = np.column_stack((reduced_design, baselines * groups))
+    denominator_df = len(paired_rows) - full_design.shape[1]
+    if (
+        denominator_df <= 0
+        or np.linalg.matrix_rank(reduced_design) < reduced_design.shape[1]
+        or np.linalg.matrix_rank(full_design) < full_design.shape[1]
+    ):
+        return unavailable("資料不足或前測數值缺乏變異，無法估計前測與組別的交互作用。")
+
+    reduced_coefficients, _, _, _ = np.linalg.lstsq(reduced_design, outcomes, rcond=None)
+    full_coefficients, _, _, _ = np.linalg.lstsq(full_design, outcomes, rcond=None)
+    reduced_residuals = outcomes - reduced_design @ reduced_coefficients
+    full_residuals = outcomes - full_design @ full_coefficients
+    reduced_sse = float(reduced_residuals @ reduced_residuals)
+    full_sse = float(full_residuals @ full_residuals)
+    if full_sse <= 0:
+        return unavailable("完整模型沒有可估計的殘差變異，無法進行迴歸斜率同質性檢定。")
+
+    numerator_df = 1.0
+    f_statistic = max((reduced_sse - full_sse) / numerator_df, 0.0) / (
+        full_sse / denominator_df
+    )
+    try:
+        from scipy.stats import f as f_distribution
+    except ImportError as exc:
+        raise AnalysisDataError("組間統計需要 scipy，請先安裝 requirements.txt。") from exc
+    p_value = float(f_distribution.sf(f_statistic, numerator_df, denominator_df))
+    homogeneous = p_value >= 0.05
+    note = (
+        "前測×組別交互作用未達顯著（p ≥ 0.05），符合迴歸斜率同質性假設。"
+        if homogeneous
+        else "前測×組別交互作用達顯著（p < 0.05），不符合迴歸斜率同質性假設；ANCOVA 結果應審慎解讀。"
+    )
+    return AncovaHomogeneityTestResult(
+        experimental_count=len(experimental),
+        control_count=len(control),
+        f_statistic=f_statistic,
+        numerator_degrees_freedom=numerator_df,
+        denominator_degrees_freedom=float(denominator_df),
+        p_value=p_value,
+        homogeneous=homogeneous,
+        note=note,
+    )
+
+
 def compare_runs(
     first: RunAnalysis,
     second: RunAnalysis,
@@ -751,6 +834,7 @@ def compare_runs(
         for group_name in ("實驗組", "對照組")
     )
     group_effect_tests = (_welch_change_test(rows), _ancova_test(rows))
+    ancova_homogeneity_test = _ancova_homogeneity_test(rows)
     return ExperimentComparison(
         metric,
         pairing_mode,
@@ -758,6 +842,7 @@ def compare_runs(
         overall,
         group_results,
         group_effect_tests,
+        ancova_homogeneity_test,
         first_source,
         second_source,
         first.source_files,

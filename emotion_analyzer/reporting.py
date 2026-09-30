@@ -631,7 +631,33 @@ def write_comparison_report(path: Path, comparison: ExperimentComparison) -> Non
             if isinstance(cell.value, (int, float)):
                 cell.number_format = "0.000000"
 
-    chart_data_row = group_test_header_row + len(comparison.group_effect_tests) + 3
+    homogeneity_title_row = group_test_header_row + len(comparison.group_effect_tests) + 2
+    summary.cell(homogeneity_title_row, 1, "ANCOVA 迴歸斜率同質性檢定")
+    summary.cell(homogeneity_title_row, 1).font = Font(
+        name="Arial", size=12, bold=True, color="1F1F1F"
+    )
+    homogeneity = comparison.ancova_homogeneity_test
+    homogeneity_headers = ["檢定項目", "實驗組n", "對照組n", "F值", "分子自由度", "分母自由度", "p值", "結論"]
+    for column, value in enumerate(homogeneity_headers, 1):
+        summary.cell(homogeneity_title_row + 1, column, value)
+    _style_header(summary, homogeneity_title_row + 1, 1, len(homogeneity_headers))
+    summary.append(
+        [
+            "前測×組別交互作用",
+            homogeneity.experimental_count,
+            homogeneity.control_count,
+            homogeneity.f_statistic,
+            homogeneity.numerator_degrees_freedom,
+            homogeneity.denominator_degrees_freedom,
+            homogeneity.p_value,
+            homogeneity.note,
+        ]
+    )
+    for cell in summary[homogeneity_title_row + 2][3:7]:
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = "0.000000"
+
+    chart_data_row = homogeneity_title_row + 4
     summary.cell(chart_data_row, 1, "範圍")
     summary.cell(chart_data_row, 2, comparison.first_source)
     summary.cell(chart_data_row, 3, comparison.second_source)

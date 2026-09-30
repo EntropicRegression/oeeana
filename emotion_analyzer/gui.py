@@ -851,8 +851,14 @@ def run_gui() -> int:
             return "\n".join(lines)
 
         def _comparison_full_summary_text(self, comparison) -> str:
+            homogeneity = comparison.ancova_homogeneity_test
             return (
                 f"{self._comparison_summary_text(comparison.overall)}\n\n"
+                "ANCOVA 迴歸斜率同質性檢定\n"
+                f"前測×組別：F={self._number_text(homogeneity.f_statistic)}、"
+                f"df=({self._number_text(homogeneity.numerator_degrees_freedom)}, "
+                f"{self._number_text(homogeneity.denominator_degrees_freedom)})、"
+                f"p={self._number_text(homogeneity.p_value)}｜{homogeneity.note}\n\n"
                 f"組間效果檢定\n{self._group_effect_summary_text(comparison)}"
             )
 
