@@ -1113,6 +1113,95 @@ class BatchAnalyzer:
     ) -> PreprocessResult:
         return self.preprocess_many([config], progress, cancel_event)
 
+    def cut_single_audio(
+        self,
+        audio_path: Path,
+        transcript_file: Path,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        *,
+        match_threshold: float = 0.30,
+        segment_padding_seconds: float = 1.0,
+        model_name: str = "large-v3",
+        noise_reduction_enabled: bool = True,
+        noise_reduction_profile: str = DEFAULT_NOISE_REDUCTION_PROFILE,
+    ) -> PreprocessResult:
+        """Cut exactly one source audio file using the supplied transcript."""
+        audio_path = Path(audio_path)
+        transcript_file = Path(transcript_file)
+        if not audio_path.is_file():
+            raise AnalysisError("找不到來源音檔。")
+        if audio_path.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS:
+            raise AnalysisError("來源音檔格式不受支援。")
+        if not transcript_file.is_file():
+            raise AnalysisError("找不到分段文字檔。")
+        if not 0.0 <= match_threshold <= 1.0:
+            raise AnalysisError("Whisper 文字匹配門檻必須介於 0 與 1。")
+        if not 0.0 <= segment_padding_seconds <= 5.0:
+            raise AnalysisError("切段前後緩衝必須介於 0 與 5 秒。")
+        if (
+            noise_reduction_enabled
+            and noise_reduction_profile not in NOISE_REDUCTION_FILTERS
+        ):
+            raise AnalysisError(f"不支援的去雜音模式：{noise_reduction_profile}")
+
+        transcript_lines = read_transcript(transcript_file)
+        paragraphs = [(line, line) for line in transcript_lines]
+        self._check_cancel(cancel_event)
+        self._report(progress, 5, f"預處理單一音檔：{audio_path.name}")
+        audio = preprocess_audio(
+            audio_path,
+            self.ffmpeg_path,
+            noise_reduction_enabled=noise_reduction_enabled,
+            noise_reduction_profile=noise_reduction_profile,
+        )
+
+        created_whisper = self.whisper_segmenter is None
+        if created_whisper:
+            self.whisper_segmenter = WhisperSegmenter(model_name)
+        assert self.whisper_segmenter is not None
+        release_whisper = created_whisper or isinstance(self.whisper_segmenter, WhisperSegmenter)
+        errors: list[str] = []
+        try:
+            self._check_cancel(cancel_event)
+            self._report(progress, 20, f"辨識並切段：{audio_path.name}")
+            boundaries = self.whisper_segmenter.segment(
+                audio_path,
+                audio,
+                paragraphs,
+                match_threshold,
+                segment_padding_seconds,
+                self.ffmpeg_path,
+                noise_reduction_enabled,
+                noise_reduction_profile,
+            )
+            for path, boundary in zip(
+                chopped_audio_paths(audio_path, len(transcript_lines)), boundaries
+            ):
+                if not path.is_file() and boundary.audio is not None:
+                    _write_wav_file(path, boundary.audio)
+                if boundary.error:
+                    errors.append(f"{path}: {boundary.error}")
+        finally:
+            if release_whisper:
+                close = getattr(self.whisper_segmenter, "close", None)
+                if close:
+                    close()
+                self.whisper_segmenter = None
+
+        chopped_paths = chopped_audio_paths(audio_path, len(transcript_lines))
+        missing_paths = tuple(path for path in chopped_paths if not path.is_file())
+        self._report(
+            progress,
+            100,
+            f"單音檔切段完成；仍缺少 {len(missing_paths)} 個片段"
+            if missing_paths
+            else "單音檔切段完成",
+        )
+        return PreprocessResult(
+            (audio_path.resolve(),), chopped_paths, missing_paths, tuple(errors)
+        )
+
     def preprocess_many(
         self,
         configs: Sequence[AnalysisConfig],

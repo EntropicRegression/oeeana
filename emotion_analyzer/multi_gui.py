@@ -11,7 +11,7 @@ from .core import (
     EMOTION_MODEL_OPTIONS,
     read_transcript,
 )
-from .worker import create_job_file, decode_event
+from .worker import create_job_file, create_single_cut_job_file, decode_event
 
 
 @dataclass
@@ -91,6 +91,29 @@ def run_multi_gui() -> int:
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
+
+            single_group = QGroupBox("單音檔切段")
+            single_form = QFormLayout(single_group)
+            self.single_audio_field = QLineEdit()
+            self.single_audio_field.setReadOnly(True)
+            single_form.addRow(
+                "來源音檔",
+                self._picker_row(self.single_audio_field, "選擇音檔", self.pick_single_audio),
+            )
+            self.single_transcript_field = QLineEdit()
+            self.single_transcript_field.setReadOnly(True)
+            single_form.addRow(
+                "分段文字檔",
+                self._picker_row(
+                    self.single_transcript_field,
+                    "選擇 TXT",
+                    self.pick_single_transcript,
+                ),
+            )
+            self.single_cut_button = QPushButton("開始切段單一音檔")
+            self.single_cut_button.clicked.connect(self.start_single_cut)
+            single_form.addRow("", self.single_cut_button)
+            layout.addWidget(single_group)
 
             self.table = QTableWidget(0, 7)
             self.table.setHorizontalHeaderLabels(
@@ -225,6 +248,52 @@ def run_multi_gui() -> int:
 
         def set_editor_enabled(self, enabled: bool):
             self.editor_group.setEnabled(enabled)
+
+        def pick_single_audio(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "選擇單一來源音檔",
+                "",
+                "Audio (*.wav *.mp3 *.m4a *.flac)",
+            )
+            if path:
+                self.single_audio_field.setText(path)
+
+        def pick_single_transcript(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "選擇分段文字檔", "", "Text (*.txt)"
+            )
+            if not path:
+                return
+            try:
+                segment_count = len(read_transcript(Path(path)))
+            except Exception as exc:
+                QMessageBox.warning(self, "文字檔錯誤", str(exc))
+                return
+            self.single_transcript_field.setText(path)
+            self.status.setText(f"單音檔文字檔包含 {segment_count} 個段落。")
+
+        def start_single_cut(self):
+            if self.process is not None:
+                return
+            audio_text = self.single_audio_field.text().strip()
+            transcript_text = self.single_transcript_field.text().strip()
+            if not audio_text or not transcript_text:
+                QMessageBox.warning(self, "資料不足", "請選擇來源音檔與分段文字檔。")
+                return
+            try:
+                read_transcript(Path(transcript_text))
+                self.job_file = create_single_cut_job_file(
+                    Path(audio_text),
+                    Path(transcript_text),
+                    match_threshold=self.threshold.value(),
+                    segment_padding_seconds=self.padding.value(),
+                    noise_reduction_enabled=self.noise_reduction.isChecked(),
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "無法建立工作", str(exc))
+                return
+            self._launch_worker("正在切段單一音檔...")
 
         def add_set(self):
             name, ok = QInputDialog.getText(
@@ -483,13 +552,20 @@ def run_multi_gui() -> int:
                 QMessageBox.warning(self, "無法建立工作", str(exc))
                 return
 
+            self._launch_worker(
+                "正在切段全部 Analysis Set..."
+                if phase == "preprocess"
+                else "正在分析全部 Analysis Set..."
+            )
+
+        def _launch_worker(self, status_text: str):
             self.stdout_buffer = ""
             self.log.clear()
             self.progress.setValue(0)
             self.preprocess_button.setEnabled(False)
             self.analyze_button.setEnabled(False)
+            self.single_cut_button.setEnabled(False)
             self.cancel_button.setEnabled(True)
-
             process = QProcess(self)
             self.process = process
             process.setProgram(sys.executable)
@@ -498,11 +574,7 @@ def run_multi_gui() -> int:
             process.readyReadStandardOutput.connect(self.read_stdout)
             process.readyReadStandardError.connect(self.read_stderr)
             process.finished.connect(self.process_finished)
-            self.status.setText(
-                "正在切段全部 Analysis Set..."
-                if phase == "preprocess"
-                else "正在分析全部 Analysis Set..."
-            )
+            self.status.setText(status_text)
             process.start()
 
         def read_stdout(self):
@@ -588,6 +660,7 @@ def run_multi_gui() -> int:
             self.process = None
             self.preprocess_button.setEnabled(True)
             self.analyze_button.setEnabled(True)
+            self.single_cut_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
 
         def cancel_job(self):

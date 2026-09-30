@@ -19,7 +19,7 @@ from .multi_reporting import write_failed_set_report, write_multi_set_report
 
 EVENT_PREFIX = "@@OEEANA_EVENT@@"
 EventSink = Callable[[dict[str, object]], None]
-JOB_PHASES = frozenset({"full", "preprocess", "analyze"})
+JOB_PHASES = frozenset({"full", "preprocess", "analyze", "single_cut"})
 
 
 def _config_to_payload(config: AnalysisConfig) -> dict[str, object]:
@@ -65,6 +65,35 @@ def create_job_file(
     os.close(descriptor)
     path = Path(raw_path)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def create_single_cut_job_file(
+    audio_path: Path,
+    transcript_file: Path,
+    *,
+    match_threshold: float = 0.30,
+    segment_padding_seconds: float = 1.0,
+    noise_reduction_enabled: bool = True,
+) -> Path:
+    """Serialize a cut-only request that targets exactly one audio file."""
+    descriptor, raw_path = tempfile.mkstemp(prefix="oeeana-single-cut-", suffix=".json")
+    os.close(descriptor)
+    path = Path(raw_path)
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "single_cut",
+                "audio_path": str(audio_path),
+                "transcript_file": str(transcript_file),
+                "match_threshold": match_threshold,
+                "segment_padding_seconds": segment_padding_seconds,
+                "noise_reduction_enabled": noise_reduction_enabled,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -256,8 +285,40 @@ def run_job(
     combined_output: Path | None = None
     set_errors: list[str] = []
     try:
-        configs = load_job_files(job_file)
         phase = load_job_phase(job_file)
+        if phase == "single_cut":
+            payload = json.loads(job_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("單音檔切段工作格式錯誤。")
+            audio_path = Path(str(payload.get("audio_path", "")))
+            transcript_file = Path(str(payload.get("transcript_file", "")))
+            analyzer = analyzer_factory()
+            result = analyzer.cut_single_audio(
+                audio_path,
+                transcript_file,
+                lambda value, message: emit(
+                    {"event": "progress", "value": int(value), "message": str(message)}
+                ),
+                match_threshold=float(payload.get("match_threshold", 0.30)),
+                segment_padding_seconds=float(
+                    payload.get("segment_padding_seconds", 1.0)
+                ),
+                noise_reduction_enabled=bool(
+                    payload.get("noise_reduction_enabled", True)
+                ),
+            )
+            emit(
+                {
+                    "event": "finished",
+                    "phase": phase,
+                    "chopped_paths": [str(path) for path in result.chopped_paths],
+                    "missing_chopped_paths": [str(path) for path in result.missing_paths],
+                    "errors": list(result.errors),
+                }
+            )
+            return 0
+
+        configs = load_job_files(job_file)
         requested_skip_missing = load_job_skip_missing(job_file)
         compatible = _batch_compatible(configs)
         multi_set = len(configs) > 1 and not compatible
